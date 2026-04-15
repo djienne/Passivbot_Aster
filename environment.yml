@@ -1,0 +1,9 @@
+name: passivbot
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - -r requirements-live.txt
+      - -r requirements-rust.txt
