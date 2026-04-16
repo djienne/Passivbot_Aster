@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 import time
 from dataclasses import dataclass
@@ -20,13 +21,31 @@ def _is_awaitable(value: Any) -> bool:
     return hasattr(value, "__await__")
 
 
+def _exponential_backoff_delay(
+    attempt: int,
+    *,
+    base: float,
+    cap: float,
+    jitter_fraction: float,
+) -> float:
+    capped = min(float(cap), float(base) * (2 ** max(int(attempt), 0)))
+    if jitter_fraction <= 0.0:
+        return capped
+    return capped + random.uniform(0.0, capped * jitter_fraction)
+
+
 @dataclass(frozen=True)
 class AsterWebsocketConfig:
     ws_url: str = ASTER_DEFAULT_WS_URL
     keepalive_interval_seconds: float = 1800.0
     forced_reconnect_seconds: float = 23 * 60 * 60
-    private_stale_seconds: float = 30.0
-    public_stale_seconds: float = 10.0
+    private_stale_seconds: Optional[float] = None
+    public_stale_seconds: float = 60.0
+    receive_timeout_seconds: float = 5.0
+    heartbeat_seconds: float = 20.0
+    backoff_initial_seconds: float = 1.0
+    backoff_max_seconds: float = 60.0
+    backoff_jitter_fraction: float = 0.25
 
     @classmethod
     def from_credentials(cls, credentials: AsterConfiguration) -> "AsterWebsocketConfig":
@@ -53,6 +72,8 @@ class AsterWebsocketManager:
         self._listen_key_mode: str = self.config.private_stream_mode
         self._last_private_message_s = 0.0
         self._last_public_message_s = 0.0
+        self._private_failures = 0
+        self._public_failures = 0
 
     def describe_private_stream_plan(self) -> dict[str, Any]:
         return {
@@ -84,12 +105,31 @@ class AsterWebsocketManager:
                 return
             await self.rest_client.keepalive_listen_key(self._listen_key)
 
+    def _private_stream_is_stale(self) -> bool:
+        stale_seconds = self.config.private_stale_seconds
+        if stale_seconds is None or stale_seconds <= 0.0:
+            return False
+        return time.monotonic() - self._last_private_message_s >= stale_seconds
+
+    def _public_stream_is_stale(self) -> bool:
+        stale_seconds = self.config.public_stale_seconds
+        if stale_seconds is None or stale_seconds <= 0.0:
+            return False
+        return time.monotonic() - self._last_public_message_s >= stale_seconds
+
+    @staticmethod
+    def _raise_if_task_failed(task: Optional[asyncio.Task], label: str) -> None:
+        if task is None or not task.done() or task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            raise ConnectionError(f"{label} failed: {exc}") from exc
+
     async def _run_private_loop(
         self,
         private_message_callback,
         private_reconnect_callback,
     ) -> None:
-        backoff = 1.0
         while not self._stop.is_set():
             keepalive_task: Optional[asyncio.Task] = None
             start_s = time.monotonic()
@@ -97,24 +137,30 @@ class AsterWebsocketManager:
                 listen_key, mode = await self._obtain_listen_key()
                 self._listen_key = listen_key
                 self._listen_key_mode = mode
+                logging.info("Aster private WS connecting: %s", f"{self._ws_root()}/ws/{listen_key}")
                 self._private_ws = await self.rest_client.session.ws_connect(
                     f"{self._ws_root()}/ws/{listen_key}",
-                    heartbeat=20.0,
+                    heartbeat=self.config.heartbeat_seconds,
                     autoping=True,
                 )
-                backoff = 1.0
+                self._private_failures = 0
                 self._last_private_message_s = time.monotonic()
                 keepalive_task = asyncio.create_task(self._keepalive_loop())
+                logging.info("Aster private WS connected")
                 while not self._stop.is_set():
+                    self._raise_if_task_failed(keepalive_task, "aster private websocket keepalive")
                     if time.monotonic() - start_s >= self.config.forced_reconnect_seconds:
                         raise TimeoutError("aster private websocket forced reconnect")
                     try:
-                        msg = await asyncio.wait_for(self._private_ws.receive(), timeout=5.0)
+                        msg = await asyncio.wait_for(
+                            self._private_ws.receive(),
+                            timeout=self.config.receive_timeout_seconds,
+                        )
                     except asyncio.TimeoutError:
-                        if (
-                            time.monotonic() - self._last_private_message_s
-                            >= self.config.private_stale_seconds
-                        ):
+                        self._raise_if_task_failed(
+                            keepalive_task, "aster private websocket keepalive"
+                        )
+                        if self._private_stream_is_stale():
                             raise TimeoutError("aster private websocket stale")
                         continue
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -128,9 +174,21 @@ class AsterWebsocketManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._private_failures += 1
+                delay = _exponential_backoff_delay(
+                    self._private_failures - 1,
+                    base=self.config.backoff_initial_seconds,
+                    cap=self.config.backoff_max_seconds,
+                    jitter_fraction=self.config.backoff_jitter_fraction,
+                )
+                logging.warning(
+                    "Aster private WS reconnect scheduled in %.1fs after %s consecutive failure(s): %s",
+                    delay,
+                    self._private_failures,
+                    exc,
+                )
                 await self._call_callback(private_reconnect_callback, exc, self._listen_key_mode)
-                await asyncio.sleep(backoff + random.uniform(0.0, backoff * 0.25))
-                backoff = min(backoff * 2.0, 30.0)
+                await asyncio.sleep(delay)
             finally:
                 if keepalive_task is not None:
                     keepalive_task.cancel()
@@ -159,7 +217,6 @@ class AsterWebsocketManager:
         public_reconnect_callback,
         symbols_provider: Callable[[], list[str]],
     ) -> None:
-        backoff = 1.0
         while not self._stop.is_set():
             start_s = time.monotonic()
             try:
@@ -172,23 +229,25 @@ class AsterWebsocketManager:
                     for symbol in symbols
                 )
                 ws_url = f"{self._ws_root()}/stream?streams={streams}"
+                logging.info("Aster public WS connecting: %s", ws_url)
                 self._public_ws = await self.rest_client.session.ws_connect(
                     ws_url,
-                    heartbeat=20.0,
+                    heartbeat=self.config.heartbeat_seconds,
                     autoping=True,
                 )
-                backoff = 1.0
+                self._public_failures = 0
                 self._last_public_message_s = time.monotonic()
+                logging.info("Aster public WS connected for %s stream(s)", len(symbols))
                 while not self._stop.is_set():
                     if time.monotonic() - start_s >= self.config.forced_reconnect_seconds:
                         raise TimeoutError("aster public websocket forced reconnect")
                     try:
-                        msg = await asyncio.wait_for(self._public_ws.receive(), timeout=5.0)
+                        msg = await asyncio.wait_for(
+                            self._public_ws.receive(),
+                            timeout=self.config.receive_timeout_seconds,
+                        )
                     except asyncio.TimeoutError:
-                        if (
-                            time.monotonic() - self._last_public_message_s
-                            >= self.config.public_stale_seconds
-                        ):
+                        if self._public_stream_is_stale():
                             raise TimeoutError("aster public websocket stale")
                         continue
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -207,9 +266,21 @@ class AsterWebsocketManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._public_failures += 1
+                delay = _exponential_backoff_delay(
+                    self._public_failures - 1,
+                    base=self.config.backoff_initial_seconds,
+                    cap=self.config.backoff_max_seconds,
+                    jitter_fraction=self.config.backoff_jitter_fraction,
+                )
+                logging.warning(
+                    "Aster public WS reconnect scheduled in %.1fs after %s consecutive failure(s): %s",
+                    delay,
+                    self._public_failures,
+                    exc,
+                )
                 await self._call_callback(public_reconnect_callback, exc)
-                await asyncio.sleep(backoff + random.uniform(0.0, backoff * 0.25))
-                backoff = min(backoff * 2.0, 30.0)
+                await asyncio.sleep(delay)
             finally:
                 if self._public_ws is not None:
                     try:

@@ -14,6 +14,20 @@ Current assumption:
 - only the Aster Pro V3 API is supported
 - V1/V2 fallback paths are removed from the connector
 
+## Source Of Truth
+
+The current Aster docs are inconsistent across official properties.
+
+- The GitHub docs repo still says `V3 (Recommended)` for new integrations and documents the wallet-signing Pro API used by this connector.
+- Parts of the docs website still show older API-key / HMAC-style futures pages and older listen-key examples.
+
+For this Passivbot connector, treat these as authoritative first:
+
+- `https://github.com/asterdex/api-docs/blob/master/README.md`
+- `https://github.com/asterdex/api-docs/blob/master/V3(Recommended)/EN/aster-finance-futures-api-v3.md`
+
+Do not use the local `ASTER_code_example` as the source of truth for user-stream auth. It is a useful reference for message shapes and workflows, but it is a legacy/hybrid example and should not override the official V3 docs.
+
 ## Credentials
 
 Use the `aster_01` example in `api-keys.json.example`.
@@ -43,6 +57,34 @@ Optional fields:
 
 The connector currently keeps Aster in one-way mode by default. This is the safer default because Aster does not accept `reduceOnly` in hedge mode.
 
+## Websocket Behavior
+
+Current official V3 user-stream rules:
+
+- `listenKey` is valid for 60 minutes after creation
+- `PUT /fapi/v3/listenKey` extends it for another 60 minutes
+- user streams are accessed at `wss://fstream.asterdex.com/ws/<listenKey>`
+- a single websocket connection is only valid for 24 hours
+- user data payloads are not guaranteed to be ordered during heavy periods; order them by event time `E`
+- websocket server ping cadence documented for market streams is every 5 minutes, with disconnect if no pong is received within 15 minutes
+
+Connector policy in this repo:
+
+- private WS keepalive refresh runs every 30 minutes
+- private WS is rotated before the 24-hour cutoff
+- private WS does not assume silence means failure
+  Quiet accounts may legitimately receive no user events for long periods.
+- aiohttp websocket heartbeat/autoping is used so ping/pong is handled automatically
+- on reconnect, the connector reconciles balances, positions, and open orders via REST
+- reconnects use exponential backoff with jitter rather than a tight retry loop
+
+Practical guidance:
+
+- for private WS, do not trigger reconnects just because there have been no account events for a short period
+- for public WS, a shorter stale timer is still reasonable because `bookTicker` should update regularly on active symbols
+- if `listenKeyExpired` is received, reacquire a fresh listen key and resync state
+- if repeated reconnects happen, back off aggressively to avoid self-inflicted churn and rate-limit pressure
+
 ## Historical data
 
 Aster now works with:
@@ -69,6 +111,14 @@ Implemented and unit-tested in this repo:
 - fill-event recovery
 - offline candle/backtest integration
 
-Not validated in this environment:
+Validated manually in this environment:
 
-- real-account live smoke tests against Aster production
+- live credential/auth checks
+- leverage update on `HYPE`
+- post-only order create/detect/cancel via REST and WS
+- maker fill detection with zero-fee entry verification
+- reduce-only market close detection
+
+Still not validated here:
+
+- long-duration unattended live runs over many hours or days

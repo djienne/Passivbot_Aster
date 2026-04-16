@@ -1,28 +1,22 @@
 ![Passivbot](docs/images/pbot_logo_full.svg)
 
-# Passivbot - Lighter Exchange Fork
+# Passivbot - Aster-Focused Fork
 
 > **Video tutorial:** Watch the associated walkthrough on YouTube: https://youtu.be/E87Pbgfosoo
 
-A fork of [Passivbot](https://github.com/enarjord/passivbot) adapted to run on [Lighter](https://lighter.xyz) — a ZK-rollup perpetuals DEX with **zero trading fees for both maker and taker orders**.
+A fork of [Passivbot](https://github.com/enarjord/passivbot) focused on **Aster perpetuals (Pro API / V3)**, while still retaining the custom [Lighter](https://lighter.xyz) connector.
 
-Passivbot is a high-frequency market-making bot that places and cancels large numbers of limit orders. On a traditional exchange, fees would eat deeply into returns. Lighter's zero-fee model for both maker and taker orders makes it an ideal venue for this strategy: every trade that would otherwise cost fees is pure profit instead.
+This repo now supports:
 
-> **Affiliate link to support this project:** [Trade on Lighter](https://app.lighter.xyz/?referral=FREQTRADE) — spot & perpetuals, fully decentralized, no KYC, zero fees for both maker and taker orders.
+- **Aster** as the main actively integrated exchange path
+- **Lighter** as a retained custom connector path
+- historical candle download, backtesting, and live trading flows around those integrations
 
 :warning: **Used at one's own risk** :warning:
 
-> :penguin: **Linux only** — the `lighter` Python SDK requires Linux for transaction signing. Windows users must run this inside [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) or Docker.
+> **Deployment note:** A Linux VPS is recommended. Python 3.12 is required for this repo version.
 >
-> macOS has not been tested natively, but Docker on macOS will work.
->
-> A Linux VPS is also a good option and is even recommended. This bot does not need a fast or expensive VPS, since latency is not a major concern for Passivbot in general.
-
-> :warning: **Lighter account type requirement:** Use a **Simple Trading Account**. Do **not** use a **Unified Trading Account (UTA)**.
-> 
-> :warning: Recommended to use a **sub-account**.
->
-> **Recommended Lighter tier:** The **Free** tier works well with Passivbot. It keeps trading at **0 fees for both maker and taker orders**, and in practice its latency has not been a problem for this bot.
+> **Lighter-specific note:** the `lighter` SDK still requires Linux for signing. That Linux-only restriction is about the Lighter connector, not the Aster integration in general.
 
 <p align="center">
   <img src="account.png" alt="Lighter account type selection showing that Simple Trading Account should be used instead of Unified Trading Account (UTA)" width="900" />
@@ -32,15 +26,21 @@ v7.8.4
 
 ## Fork Overview
 
-> :warning: This is a **heavily modified fork** of [enarjord/passivbot](https://github.com/enarjord/passivbot) (v7.8.4). It has been substantially reworked to run exclusively on [Lighter](https://lighter.xyz). It is **not a drop-in replacement** for upstream passivbot and is not compatible with the exchanges supported there (Binance, Bybit, Hyperliquid, etc.). If you want multi-exchange support, use the [upstream project](https://github.com/enarjord/passivbot).
+> :warning: This is a **heavily modified fork** of [enarjord/passivbot](https://github.com/enarjord/passivbot) (v7.8.4). It is **not a drop-in replacement** for upstream passivbot. The current focus of this fork is Aster perpetuals, with Lighter still supported as a custom connector.
 
 Key changes from upstream:
 
-- **Lighter exchange adapter** — full order management, position tracking, WebSocket streaming, and auth token handling via the `lighter-sdk`.
-- **Candle fetching** — direct HTTP to Lighter's `/api/v1/candles` endpoint with forward-pagination and caching (workaround for a `lighter-sdk` model bug).
-- **Docker support** — `Dockerfile_live` and `docker-compose.yml` configured to run as `passivbot-lighter-live`, isolated from any other passivbot containers.
-- **Rate limit mitigations** — 1-hour auth tokens, WS re-auth every 55 min, volume-quota-aware free-slot pacing.
-- **Linux-only runtime** — due to the `lighter` SDK's native signing dependency.
+- **Aster connector** — V3/Pro API integration for REST, websocket state, fill events, and historical candle flows.
+- **Backtesting integration** — Aster candle download and backtesting support wired into the repo’s standard HLCV preparation paths.
+- **Lighter connector retained** — the custom Lighter integration still exists and should continue to work.
+- **Docker support** — `Dockerfile_live` and `docker-compose.yml` now default to a generic live container path and can target Aster configs directly.
+- **Python 3.12-only runtime** — this repo version should be run on Python 3.12.
+
+## Exchange Focus
+
+- **Primary focus:** Aster perpetuals via Pro API / V3
+- **Still supported:** Lighter
+- **Do not assume upstream exchange parity:** this fork is custom and diverges significantly from upstream
 
 ## Overview
 
@@ -70,11 +70,11 @@ Passivbot manages underperforming, or "stuck", positions by realizing small loss
 ## Quickstart
 
 ### Prerequisites
-- Linux (the `lighter` SDK requires Linux for signing; Windows users can use WSL)
+- Linux VPS recommended
 - Python 3.12
 - Rust >= 1.90 (only needed when running without Docker; Docker builds Rust automatically)
 - Docker & Docker Compose (for containerized deployment)
-- A [Lighter](https://lighter.xyz) account with a private key
+- An Aster Pro API setup for Aster trading
 
 > **Python version policy:** Use **Python 3.12 only** for this version of Passivbot. Do not use Python 3.10, 3.11, or 3.13 for this repo.
 
@@ -95,61 +95,32 @@ conda activate passivbot
 
 ### 2. Configure API Keys
 
-Copy the example and fill in your Lighter credentials:
+Copy the example and fill in your Aster credentials:
 
 ```bash
 cp api-keys.json.example api-keys.json
 ```
 
-Edit `api-keys.json` — find the `lighter_01` entry and set:
-- `private_key` — your Lighter wallet private key
-- `account_index` — your Lighter account index (visible in the Lighter UI)
-- `api_key_index` — your API key index (from Lighter key management). **Use a value above 10** to avoid conflicts with indices reserved by the Lighter system.
+Edit `api-keys.json` — find the `aster_01` entry and set:
+- `api_user`
+- `api_signer`
+- `api_private_key`
 
-#### Finding your account index
-
-To find the `account_index` for your main account or sub-accounts, query the Lighter REST API with your L1 (wallet) address:
-
-```
-GET https://mainnet.zklighter.elliot.ai/api/v1/account?by=l1_address&value=<YOUR_L1_ADDRESS>
-```
-
-The response contains an `accounts` array listing every account tied to that address. Here is what to look for:
-
-```json
-{
-  "accounts": [
-    {
-      "account_type": 0,
-      "account_index": 107607,
-      "collateral": "0.002856",
-      ...
-    },
-    {
-      "account_type": 1,
-      "account_index": 281474976687926,
-      "collateral": "719.860000",
-      ...
-    }
-  ]
-}
-```
-
-- **`account_type`** — `0` = main account, `1` = sub-account (Simple Trading Account).
-- **`account_index`** — the value to put in `api-keys.json`. Pick the sub-account (`account_type: 1`) that holds your trading funds (check `collateral` > 0).
+See also:
+- [docs/aster_live.md](docs/aster_live.md)
 
 ### 3. Run with Docker (recommended)
 
 ```bash
-docker compose up -d                        # start passivbot-lighter-live
-docker logs -f passivbot-lighter-live       # follow logs
+docker compose up -d                        # start passivbot-live
+docker logs -f passivbot-live               # follow logs
 docker compose down                         # stop
 ```
 
 ### 4. Run directly (without Docker)
 
 ```bash
-python src/main.py configs/hype_top.json
+python src/main.py configs/hype_top_aster.json
 ```
 
 ### Logging
@@ -168,6 +139,16 @@ Running several Passivbot instances against the same exchange on one machine is 
 - Python 3.12
 - Rust >= 1.90 (for building the backtesting extension; handled automatically when using Docker)
 - [requirements-live.txt](requirements-live.txt) dependencies
+
+## Lighter Notes
+
+Lighter support is still present in this repo, but it is no longer the main focus of the README or the default Docker/config examples.
+
+If you use Lighter:
+
+- use a **Simple Trading Account**
+- run on Linux / WSL / Docker
+- review the retained `lighter_01` entry in `api-keys.json.example`
 
 ## Pre-optimized configurations
 

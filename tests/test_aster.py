@@ -16,7 +16,7 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 from exchanges.aster import AsterBot
-from exchanges.aster_ws import AsterWebsocketConfig
+from exchanges.aster_ws import AsterWebsocketConfig, _exponential_backoff_delay
 from exchanges.aster_rest import (
     ASTER_DEFAULT_BASE_URL,
     ASTER_DEFAULT_WS_URL,
@@ -205,6 +205,15 @@ def test_websocket_config_defaults_follow_credentials():
         AsterConfiguration.from_user_info({"exchange": "aster"})
     )
     assert cfg.private_stream_mode == "v3"
+    assert cfg.private_stale_seconds is None
+
+
+def test_websocket_backoff_delay_exponentially_grows_and_caps(monkeypatch):
+    monkeypatch.setattr("exchanges.aster_ws.random.uniform", lambda a, b: 0.0)
+    assert _exponential_backoff_delay(0, base=1.0, cap=60.0, jitter_fraction=0.25) == 1.0
+    assert _exponential_backoff_delay(1, base=1.0, cap=60.0, jitter_fraction=0.25) == 2.0
+    assert _exponential_backoff_delay(2, base=1.0, cap=60.0, jitter_fraction=0.25) == 4.0
+    assert _exponential_backoff_delay(8, base=1.0, cap=60.0, jitter_fraction=0.25) == 60.0
 
 
 def test_translate_exchange_info_normalizes_symbols_and_filters():
