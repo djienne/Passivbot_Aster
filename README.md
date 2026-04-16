@@ -2,11 +2,11 @@
 
 # Passivbot - Aster Fork
 
-This is a heavily modified fork of [Passivbot](https://github.com/enarjord/passivbot) intended and documented for **Aster perpetuals only**.
+This is a heavily modified fork of [Passivbot](https://github.com/enarjord/passivbot) intended and documented primarily for **Aster perpetuals**.
 
 The main Aster advantage for this fork is simple: **0 maker fees**. Passivbot works best as a maker-style bot that keeps posting and refreshing passive limit orders, so Aster's fee model is a strong fit for how this strategy is meant to run.
 
-This repo still contains a legacy [Lighter](https://lighter.xyz) connector, but treat it as secondary. The README, default configs, Docker setup, and active exchange work in this fork are all aimed at Aster.
+This repo still contains inherited upstream exchange connectors plus a legacy [Lighter](https://lighter.xyz) path, but treat them as secondary. The README, default configs, Docker setup, and active exchange work in this fork are all aimed at Aster.
 
 :warning: **Use at your own risk** :warning:
 
@@ -18,7 +18,7 @@ Upstream base: `v7.8.4`
 
 ## Fork Overview
 
-> :warning: This is a **heavily modified fork** of [enarjord/passivbot](https://github.com/enarjord/passivbot) (`v7.8.4`). It is **not a drop-in replacement** for upstream passivbot. The supported and documented path in this fork is Aster Pro / V3.
+> :warning: This is a **heavily modified fork** of [enarjord/passivbot](https://github.com/enarjord/passivbot) (`v7.8.4`). It is **not a drop-in replacement** for upstream passivbot. The primary supported and documented path in this fork is Aster Pro / V3.
 
 Key changes from upstream:
 
@@ -79,7 +79,7 @@ This fork is best understood as an **Aster maker-strategy fork**. If you intenti
 ### 1. Clone
 
 ```bash
-git clone <this-repo> passivbot_aster
+git clone https://github.com/djienne/Passivbot_Aster.git passivbot_aster
 cd passivbot_aster
 ```
 
@@ -127,6 +127,8 @@ pip install -r requirements-live.txt
 python src/main.py configs/config_hype_aster.json
 ```
 
+`requirements-live.txt` already includes `requirements-rust.txt`. On the first non-Docker run, `src/main.py` may build or refresh the Rust extension automatically. If that fails, install the Rust/C build prerequisites from [docs/installation.md](docs/installation.md) or use Docker instead.
+
 If you use Conda, the repo also includes a pinned environment file:
 
 ```bash
@@ -170,9 +172,15 @@ If you use Lighter anyway:
 - run on Linux, WSL, or Docker
 - review the retained `lighter_01` entry in `api-keys.json.example`
 
-## Pre-optimized Configurations
+## Included Aster Configs
 
-Coming soon.
+The repo already ships a few Aster-focused starting points:
+
+- `configs/config_hype_aster.json` - current Docker default; HYPE-only; `post_only`; `market_orders_allowed = false`
+- `configs/config_aster.json` - simpler general Aster example config
+- `configs/hype_top_aster.json` - another Aster example with looser live-order defaults; also used by the manual live smoke scripts
+
+Treat these as starting points, not as plug-and-play promises of profitability or safety.
 
 See also: https://pbconfigdb.scud.dedyn.io/
 
