@@ -11,7 +11,7 @@ services:
     working_dir: /app
     environment:
       PYTHONUNBUFFERED: "1"
-      PASSIVBOT_CONFIG: "configs/hype_top_aster.json"
+      PASSIVBOT_CONFIG: "configs/config_hype_aster.json"
       PASSIVBOT_ARGS: ""
     command:
       - sh
