@@ -100,12 +100,14 @@ class AsterWebsocketManager:
 
     async def _obtain_listen_key(self) -> tuple[str, str]:
         listen_key = await self.rest_client.create_listen_key()
-        if self.config.immediate_keepalive_on_connect and listen_key:
-            await self.rest_client.keepalive_listen_key(listen_key)
-            logging.info(
-                "Aster private WS immediate keepalive sent for listen key prefix=%s",
-                listen_key[:12],
-            )
+        # Aster backend appears to invalidate the key ~27s later if we send
+        # a PUT immediately after the initial POST.
+        # if self.config.immediate_keepalive_on_connect and listen_key:
+        #     await self.rest_client.keepalive_listen_key(listen_key)
+        #     logging.info(
+        #         "Aster private WS immediate keepalive sent for listen key prefix=%s",
+        #         listen_key[:12],
+        #     )
         return listen_key, "v3"
 
     async def _keepalive_loop(self) -> None:

@@ -872,12 +872,12 @@ class AsterRestClient:
         return listen_key
 
     async def keepalive_listen_key(self, listen_key: str) -> None:
-        params = {"listenKey": listen_key}
-        await self._private_request_json("PUT", ASTER_LISTEN_KEY_PATHS, params=params)
+        # V3 docs say "Parameters: None" - do not pass the listenKey in params
+        await self._private_request_json("PUT", ASTER_LISTEN_KEY_PATHS)
 
     async def close_listen_key(self, listen_key: str) -> None:
-        params = {"listenKey": listen_key}
+        # V3 docs say "Parameters: None" - do not pass the listenKey in params
         try:
-            await self._private_request_json("DELETE", ASTER_LISTEN_KEY_PATHS, params=params)
+            await self._private_request_json("DELETE", ASTER_LISTEN_KEY_PATHS)
         except Exception:
             return
