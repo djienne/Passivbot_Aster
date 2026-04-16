@@ -144,9 +144,28 @@ class AsterWebsocketManager:
             keepalive_task: Optional[asyncio.Task] = None
             start_s = time.monotonic()
             try:
-                listen_key, mode = await self._obtain_listen_key()
-                self._listen_key = listen_key
-                self._listen_key_mode = mode
+                # Prefer reusing an existing listen key via keepalive (PUT)
+                # rather than always creating a new one (POST).  This avoids
+                # a race where a previous DELETE hasn't fully propagated and
+                # the POST returns the same key that is being invalidated.
+                if self._listen_key:
+                    try:
+                        await self.rest_client.keepalive_listen_key(self._listen_key)
+                        listen_key = self._listen_key
+                        mode = self._listen_key_mode
+                        logging.info(
+                            "Aster private WS reusing existing listen key prefix=%s",
+                            listen_key[:12],
+                        )
+                    except Exception:
+                        self._listen_key = ""
+                        listen_key, mode = await self._obtain_listen_key()
+                        self._listen_key = listen_key
+                        self._listen_key_mode = mode
+                else:
+                    listen_key, mode = await self._obtain_listen_key()
+                    self._listen_key = listen_key
+                    self._listen_key_mode = mode
                 logging.info("Aster private WS connecting: %s", f"{self._ws_root()}/ws/{listen_key}")
                 self._private_ws = await self.rest_client.session.ws_connect(
                     f"{self._ws_root()}/ws/{listen_key}",
@@ -209,6 +228,15 @@ class AsterWebsocketManager:
                     cap=self.config.backoff_max_seconds,
                     jitter_fraction=self.config.backoff_jitter_fraction,
                 )
+                # For listenKeyExpired, enforce a minimum delay so the
+                # server has time to fully process the invalidation before
+                # we request or reuse a key.
+                if isinstance(exc, AsterListenKeyExpired):
+                    delay = max(delay, 5.0)
+                    # The expired key is useless — clear it so the next
+                    # iteration creates a fresh one instead of trying to
+                    # keepalive a dead key.
+                    self._listen_key = ""
                 logging.warning(
                     "Aster private WS reconnect scheduled in %.1fs after %s consecutive failure(s): %s",
                     delay,
@@ -230,12 +258,14 @@ class AsterWebsocketManager:
                     except Exception:
                         pass
                     self._private_ws = None
-                if self._listen_key:
-                    try:
-                        await self.rest_client.close_listen_key(self._listen_key)
-                    except Exception:
-                        pass
-                    self._listen_key = ""
+                # Do NOT delete the listen key on reconnect.  Per Aster V3
+                # docs, POST returns the same active key and extends it.
+                # DELETEing here creates a race: the next POST may return a
+                # key that the server is still invalidating, causing an
+                # immediate listenKeyExpired within 1-3s.  The key reference
+                # is kept so the next iteration can try to reuse it via
+                # keepalive.  Deletion only happens on graceful shutdown
+                # (handled by close()).
                 self._private_connected_at_s = 0.0
                 if self._stop.is_set():
                     return
