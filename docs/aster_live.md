@@ -85,6 +85,37 @@ Practical guidance:
 - if `listenKeyExpired` is received, reacquire a fresh listen key and resync state
 - if repeated reconnects happen, back off aggressively to avoid self-inflicted churn and rate-limit pressure
 
+## Troubleshooting
+
+For private user-stream debugging, use:
+
+- `python src/tools/aster_live_user_stream_probe.py configs/config_hype_aster.json --confirm-live`
+
+This probe:
+
+- creates a V3 listen key using the current wallet-signing flow
+- optionally sends an immediate keepalive
+- connects directly to the private websocket
+- logs the exact payloads received, including any `listenKeyExpired` event
+
+If you see immediate `listenKeyExpired` events in production:
+
+- treat that as a listen-key lifecycle/authentication problem, not as a quiet-socket stale timeout
+- capture the raw payload and connection age before changing reconnect thresholds
+- verify the behavior against the current official V3 docs and production with the probe before changing the main bot logic further
+
+Observed on 2026-04-16:
+
+- a standalone live probe using the current V3 wallet-signing flow was able to create a listen key, connect, and stay connected for 20 seconds with no `listenKeyExpired` event
+- the full Passivbot live run still received payloads shaped like:
+  - `{"e":"listenKeyExpired","E":...,"listenKey":"..."}`
+- in the full bot path, these expirations were seen after roughly `0.5s` to `27.7s` from connect
+
+Inference:
+
+- production does appear to accept the current V3 wallet-signed listen-key flow at least in a direct probe
+- the remaining problem is likely in the bot-path lifecycle or startup interaction around the private user stream, not an outright rejection of V3 by Aster production
+
 ## Historical data
 
 Aster now works with:

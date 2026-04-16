@@ -251,12 +251,13 @@ from pure_funcs import (
 )
 
 ONE_MIN_MS = 60_000
+_ACTIVE_BOT = None
 
 
 def signal_handler(sig, frame):
     """Handle SIGINT by signalling the running bot to stop gracefully."""
     print("\nReceived shutdown signal. Stopping bot...")
-    bot = globals().get("bot")
+    bot = _ACTIVE_BOT
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
@@ -274,6 +275,8 @@ def signal_handler(sig, frame):
 
 
 signal.signal(signal.SIGINT, signal_handler)
+if hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, signal_handler)
 
 
 def get_function_name():
@@ -5646,7 +5649,6 @@ def setup_bot(config):
 async def shutdown_bot(bot):
     """Stop background tasks and close the exchange clients gracefully."""
     print("Shutting down bot...")
-    bot.stop_data_maintainers()
     try:
         await asyncio.wait_for(bot.close(), timeout=3.0)
     except asyncio.TimeoutError:
@@ -5793,8 +5795,9 @@ async def main():
     cooldown_secs = 60
     restarts = []
     while True:
-
+        global _ACTIVE_BOT
         bot = setup_bot(config)
+        _ACTIVE_BOT = bot
         try:
             await bot.start_bot()
         except Exception as e:
@@ -5802,13 +5805,11 @@ async def main():
             traceback.print_exc()
         finally:
             try:
-                bot.stop_data_maintainers()
-                if bot.ccp is not None:
-                    await bot.ccp.close()
-                if bot.cca is not None:
-                    await bot.cca.close()
+                await shutdown_bot(bot)
             except:
                 pass
+            finally:
+                _ACTIVE_BOT = None
         if bot.stop_signal_received:
             logging.info("Bot stopped via signal; exiting main loop.")
             break

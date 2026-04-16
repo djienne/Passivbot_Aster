@@ -715,7 +715,10 @@ class AsterBot(Passivbot):
             if "pm" in payload:
                 self._aster_dual_side_position = _safe_bool(payload.get("pm"), default=False)
         elif event_type == "listenKeyExpired":
-            logging.warning("Aster private WS listen key expired; reconnect requested.")
+            logging.warning(
+                "Aster private WS listen key expired; reconnect requested. payload=%s",
+                payload,
+            )
 
     async def _handle_public_ws_message(self, payload: dict[str, Any], stream: Optional[str]) -> None:
         if not isinstance(payload, dict):

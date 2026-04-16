@@ -38,6 +38,7 @@ def _exponential_backoff_delay(
 class AsterWebsocketConfig:
     ws_url: str = ASTER_DEFAULT_WS_URL
     keepalive_interval_seconds: float = 1800.0
+    immediate_keepalive_on_connect: bool = True
     forced_reconnect_seconds: float = 23 * 60 * 60
     private_stale_seconds: Optional[float] = None
     public_stale_seconds: float = 60.0
@@ -46,6 +47,7 @@ class AsterWebsocketConfig:
     backoff_initial_seconds: float = 1.0
     backoff_max_seconds: float = 60.0
     backoff_jitter_fraction: float = 0.25
+    backoff_reset_after_seconds: float = 60.0
 
     @classmethod
     def from_credentials(cls, credentials: AsterConfiguration) -> "AsterWebsocketConfig":
@@ -74,6 +76,8 @@ class AsterWebsocketManager:
         self._last_public_message_s = 0.0
         self._private_failures = 0
         self._public_failures = 0
+        self._private_connected_at_s = 0.0
+        self._public_connected_at_s = 0.0
 
     def describe_private_stream_plan(self) -> dict[str, Any]:
         return {
@@ -96,6 +100,12 @@ class AsterWebsocketManager:
 
     async def _obtain_listen_key(self) -> tuple[str, str]:
         listen_key = await self.rest_client.create_listen_key()
+        if self.config.immediate_keepalive_on_connect and listen_key:
+            await self.rest_client.keepalive_listen_key(listen_key)
+            logging.info(
+                "Aster private WS immediate keepalive sent for listen key prefix=%s",
+                listen_key[:12],
+            )
         return listen_key, "v3"
 
     async def _keepalive_loop(self) -> None:
@@ -143,11 +153,21 @@ class AsterWebsocketManager:
                     heartbeat=self.config.heartbeat_seconds,
                     autoping=True,
                 )
-                self._private_failures = 0
                 self._last_private_message_s = time.monotonic()
+                self._private_connected_at_s = self._last_private_message_s
                 keepalive_task = asyncio.create_task(self._keepalive_loop())
                 logging.info("Aster private WS connected")
                 while not self._stop.is_set():
+                    if (
+                        self._private_failures > 0
+                        and time.monotonic() - self._private_connected_at_s
+                        >= self.config.backoff_reset_after_seconds
+                    ):
+                        logging.info(
+                            "Aster private WS backoff reset after %.1fs of stable connection",
+                            time.monotonic() - self._private_connected_at_s,
+                        )
+                        self._private_failures = 0
                     self._raise_if_task_failed(keepalive_task, "aster private websocket keepalive")
                     if time.monotonic() - start_s >= self.config.forced_reconnect_seconds:
                         raise TimeoutError("aster private websocket forced reconnect")
@@ -168,7 +188,15 @@ class AsterWebsocketManager:
                         payload = json.loads(msg.data)
                         await self._call_callback(private_message_callback, payload, mode)
                         if payload.get("e") == "listenKeyExpired":
-                            raise AsterListenKeyExpired("listen key expired")
+                            age_s = max(0.0, time.monotonic() - self._private_connected_at_s)
+                            logging.warning(
+                                "Aster private WS received listenKeyExpired after %.2fs | payload=%s",
+                                age_s,
+                                payload,
+                            )
+                            raise AsterListenKeyExpired(
+                                f"listen key expired after {age_s:.2f}s"
+                            )
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         raise ConnectionError("aster private websocket closed")
             except asyncio.CancelledError:
@@ -208,6 +236,7 @@ class AsterWebsocketManager:
                     except Exception:
                         pass
                     self._listen_key = ""
+                self._private_connected_at_s = 0.0
                 if self._stop.is_set():
                     return
 
@@ -235,10 +264,20 @@ class AsterWebsocketManager:
                     heartbeat=self.config.heartbeat_seconds,
                     autoping=True,
                 )
-                self._public_failures = 0
                 self._last_public_message_s = time.monotonic()
+                self._public_connected_at_s = self._last_public_message_s
                 logging.info("Aster public WS connected for %s stream(s)", len(symbols))
                 while not self._stop.is_set():
+                    if (
+                        self._public_failures > 0
+                        and time.monotonic() - self._public_connected_at_s
+                        >= self.config.backoff_reset_after_seconds
+                    ):
+                        logging.info(
+                            "Aster public WS backoff reset after %.1fs of stable connection",
+                            time.monotonic() - self._public_connected_at_s,
+                        )
+                        self._public_failures = 0
                     if time.monotonic() - start_s >= self.config.forced_reconnect_seconds:
                         raise TimeoutError("aster public websocket forced reconnect")
                     try:
@@ -288,6 +327,7 @@ class AsterWebsocketManager:
                     except Exception:
                         pass
                     self._public_ws = None
+                self._public_connected_at_s = 0.0
                 if self._stop.is_set():
                     return
 
