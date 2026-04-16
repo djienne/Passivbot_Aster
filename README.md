@@ -10,7 +10,7 @@ This repo still contains a legacy [Lighter](https://lighter.xyz) connector, but 
 
 :warning: **Use at your own risk** :warning:
 
-> **Deployment note:** Docker or a Linux VPS is recommended for live use.
+> **Deployment note:** Docker and/or a Linux VPS is recommended for live use.
 >
 > **Python version policy:** Use **Python 3.12 only** for this repo. Do not use Python 3.10, 3.11, or 3.13.
 
@@ -33,9 +33,7 @@ Key changes from upstream:
 - **Intended exchange:** Aster perpetuals via Pro API / V3.
 - **Main economic advantage:** Aster currently offers `0 maker fees`.
 - **Best fit for Passivbot:** Passivbot is designed around repeatedly posting and refreshing passive orders rather than chasing price with taker entries.
-- **Strict maker-only recommendation:** if you want the bot to stay maker-only, set `time_in_force` to `post_only` and `market_orders_allowed` to `false` in your live config before going live.
 - **Important accuracy note:** the shipped example configs are Aster-focused, but they are not all locked to strict maker-only defaults out of the box.
-- **Do not assume upstream exchange parity:** this fork is custom and diverges significantly from upstream.
 
 ## Overview
 
