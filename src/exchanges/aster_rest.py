@@ -397,6 +397,9 @@ class AsterRestClient:
             "setMarginMode": True,
             "setPositionMode": True,
         }
+        self._private_request_lock = asyncio.Lock()
+        self._last_nonce = 0
+        self._last_timestamp_ms = 0
 
     async def ensure_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -422,13 +425,27 @@ class AsterRestClient:
                 "Aster private endpoints require api_user, api_signer, and api_private_key."
             )
 
+    def _next_nonce(self) -> int:
+        candidate = math.trunc(time.time() * 1_000_000)
+        if candidate <= self._last_nonce:
+            candidate = self._last_nonce + 1
+        self._last_nonce = candidate
+        return candidate
+
+    def _next_timestamp_ms(self) -> int:
+        candidate = int(round(time.time() * 1000))
+        if candidate < self._last_timestamp_ms:
+            candidate = self._last_timestamp_ms
+        self._last_timestamp_ms = candidate
+        return candidate
+
     def _sign_v3_params(self, params: Optional[dict[str, Any]] = None) -> dict[str, str]:
         self._require_private_credentials()
         Web3, Account, encode_defunct, encode = _load_signing_dependencies()
-        nonce = math.trunc(time.time() * 1_000_000)
+        nonce = self._next_nonce()
         payload = {k: v for k, v in (params or {}).items() if v is not None}
         payload.setdefault("recvWindow", ASTER_RECV_WINDOW)
-        payload.setdefault("timestamp", int(round(time.time() * 1000)))
+        payload.setdefault("timestamp", self._next_timestamp_ms())
         trimmed = _trim_dict(payload)
         json_str = json.dumps(trimmed, sort_keys=True, separators=(",", ":"))
         encoded = encode(
@@ -536,24 +553,25 @@ class AsterRestClient:
         *,
         params: Optional[dict[str, Any]] = None,
     ) -> Any:
-        signed_params = self._sign_v3_params(params)
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Passivbot/aster",
-        }
-        if method.upper() == "GET":
+        async with self._private_request_lock:
+            signed_params = self._sign_v3_params(params)
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Passivbot/aster",
+            }
+            if method.upper() == "GET":
+                return await self._request_json_with_fallback(
+                    method,
+                    paths,
+                    params=signed_params,
+                    headers=headers,
+                )
             return await self._request_json_with_fallback(
                 method,
                 paths,
-                params=signed_params,
+                data=signed_params,
                 headers=headers,
             )
-        return await self._request_json_with_fallback(
-            method,
-            paths,
-            data=signed_params,
-            headers=headers,
-        )
 
     async def fetch_exchange_info(self) -> dict[str, Any]:
         payload = await self._public_request_json("GET", ASTER_EXCHANGE_INFO_PATHS)

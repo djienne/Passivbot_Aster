@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import json
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,6 +24,7 @@ from exchanges.aster_rest import (
     ASTER_DEFAULT_WS_URL,
     AsterAPIError,
     AsterConfiguration,
+    AsterRestClient,
     translate_aster_exchange_info,
 )
 from fill_events_manager import _build_fetcher_for_bot
@@ -194,11 +197,88 @@ def _make_bot() -> AsterBot:
     return bot
 
 
+def _fake_signing_dependencies():
+    class FakeWeb3:
+        @staticmethod
+        def to_checksum_address(value):
+            return value
+
+        @staticmethod
+        def keccak(value):
+            return bytes.fromhex("12" * 32)
+
+    class FakeAccount:
+        @staticmethod
+        def sign_message(message, private_key):
+            return SimpleNamespace(signature=bytes.fromhex("34" * 65))
+
+    def fake_encode_defunct(*, hexstr):
+        return hexstr
+
+    def fake_encode(types, values):
+        return b"encoded"
+
+    return FakeWeb3, FakeAccount, fake_encode_defunct, fake_encode
+
+
 def test_aster_configuration_defaults():
     cfg = AsterConfiguration.from_user_info({"exchange": "aster"})
     assert cfg.base_url == ASTER_DEFAULT_BASE_URL
     assert cfg.ws_url == ASTER_DEFAULT_WS_URL
     assert cfg.balance_mode == "auto"
+
+
+def test_sign_v3_params_nonce_is_monotonic_when_clock_repeats():
+    client = AsterRestClient(
+        AsterConfiguration(
+            api_user=ASTER_USER_INFO["api_user"],
+            api_signer=ASTER_USER_INFO["api_signer"],
+            api_private_key=ASTER_USER_INFO["api_private_key"],
+        )
+    )
+    with patch("exchanges.aster_rest._load_signing_dependencies", return_value=_fake_signing_dependencies()), patch(
+        "exchanges.aster_rest.time.time", return_value=1000.0
+    ):
+        first = client._sign_v3_params({})
+        second = client._sign_v3_params({})
+    assert int(second["nonce"]) == int(first["nonce"]) + 1
+    assert int(second["timestamp"]) == int(first["timestamp"])
+
+
+@pytest.mark.asyncio
+async def test_private_request_json_serializes_signed_private_requests():
+    client = AsterRestClient(
+        AsterConfiguration(
+            api_user=ASTER_USER_INFO["api_user"],
+            api_signer=ASTER_USER_INFO["api_signer"],
+            api_private_key=ASTER_USER_INFO["api_private_key"],
+        )
+    )
+    active = 0
+    max_active = 0
+    seen_nonces = []
+
+    async def fake_request_json_with_fallback(method, paths, *, params=None, data=None, headers=None):
+        nonlocal active, max_active
+        payload = params if params is not None else data
+        seen_nonces.append(int(payload["nonce"]))
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"code": 200}
+
+    with patch("exchanges.aster_rest._load_signing_dependencies", return_value=_fake_signing_dependencies()), patch.object(
+        client, "_request_json_with_fallback", side_effect=fake_request_json_with_fallback
+    ):
+        await asyncio.gather(
+            client._private_request_json("GET", ("/fapi/v3/account",)),
+            client._private_request_json("GET", ("/fapi/v3/positionRisk",)),
+        )
+
+    assert max_active == 1
+    assert len(seen_nonces) == 2
+    assert seen_nonces[1] > seen_nonces[0]
 
 
 def test_websocket_config_defaults_follow_credentials():
