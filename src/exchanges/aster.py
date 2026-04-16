@@ -38,6 +38,7 @@ class AsterBot(Passivbot):
         self._ws_public_cache_max_age = 10.0
         self._ws_balance_cache: Optional[float] = None
         self._ws_balance_cache_ts = 0.0
+        self._ws_balance_assets_cache: dict[str, dict[str, Any]] = {}
         self._ws_positions_cache: Optional[list[dict]] = None
         self._ws_positions_cache_ts = 0.0
         self._ws_open_orders_cache: Optional[list[dict]] = None
@@ -240,6 +241,20 @@ class AsterBot(Passivbot):
             )
         return total
 
+    def _merge_balance_asset_rows(
+        self, rows: list[dict[str, Any]], *, replace: bool = False
+    ) -> None:
+        if replace:
+            self._ws_balance_assets_cache = {}
+        for row in rows:
+            asset = str(row.get("a") or row.get("asset") or "").upper()
+            if not asset:
+                continue
+            merged = dict(self._ws_balance_assets_cache.get(asset, {}))
+            merged.update({k: v for k, v in row.items() if v is not None})
+            merged["asset"] = asset
+            self._ws_balance_assets_cache[asset] = merged
+
     async def _get_multi_assets_mode(self) -> bool:
         if self._aster_multi_assets_mode is not None:
             return self._aster_multi_assets_mode
@@ -311,6 +326,10 @@ class AsterBot(Passivbot):
         if self._private_cache_is_fresh(self._ws_balance_cache_ts) and self._ws_balance_cache is not None:
             return float(self._ws_balance_cache)
         account = await self.cca.fetch_account()
+        self._merge_balance_asset_rows(
+            account.get("assets", []) if isinstance(account, dict) else [],
+            replace=True,
+        )
         multi_assets_mode = await self._get_multi_assets_mode()
         balance = self._extract_account_collateral_balance(
             account,
@@ -524,6 +543,11 @@ class AsterBot(Passivbot):
             logging.warning("Aster REST reconciliation failed after WS reconnect: %s", exc)
             return
 
+        self._merge_balance_asset_rows(
+            account.get("assets", []) if isinstance(account, dict) else [],
+            replace=True,
+        )
+
         fresh_positions = []
         for elm in positions:
             raw_symbol = str(elm.get("symbol") or "").upper()
@@ -591,7 +615,10 @@ class AsterBot(Passivbot):
         balances: list[dict[str, Any]],
         positions: Optional[list[dict[str, Any]]] = None,
     ) -> Optional[float]:
-        if not balances:
+        if balances:
+            self._merge_balance_asset_rows(balances, replace=False)
+        merged_balances = list(self._ws_balance_assets_cache.values())
+        if not merged_balances:
             return None
         positions = positions or []
         upnl_total = sum(
@@ -601,7 +628,7 @@ class AsterBot(Passivbot):
         if self._aster_multi_assets_mode:
             total = 0.0
             seen = False
-            for balance in balances:
+            for balance in merged_balances:
                 asset = str(balance.get("a") or balance.get("asset") or "").upper()
                 if asset not in {"USDT", "USDC", "USDF"}:
                     continue
@@ -614,7 +641,7 @@ class AsterBot(Passivbot):
                 )
                 seen = True
             return (total + upnl_total) if seen else None
-        for balance in balances:
+        for balance in merged_balances:
             asset = str(balance.get("a") or balance.get("asset") or "").upper()
             if asset != self.quote:
                 continue

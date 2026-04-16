@@ -540,6 +540,36 @@ async def test_handle_private_account_update_refreshes_ws_balance_and_positions(
 
 
 @pytest.mark.asyncio
+async def test_handle_private_account_update_merges_partial_multi_asset_balances():
+    bot = _make_bot()
+    bot.balance = 0.0
+    bot._aster_multi_assets_mode = True
+    bot._ws_balance_assets_cache = {
+        "USDF": {"asset": "USDF", "wb": "116.82105510"},
+        "USDT": {"asset": "USDT", "wb": "0.02067084"},
+        "USDC": {"asset": "USDC", "wb": "0.00000064"},
+    }
+    bot.handle_balance_update = AsyncMock()
+    await bot._handle_private_ws_message(
+        {
+            "e": "ACCOUNT_UPDATE",
+            "E": 1710004000000,
+            "a": {
+                "B": [{"a": "USDT", "wb": "0.12785969"}],
+                "P": [{"s": "BTCUSDT", "pa": "0.02", "ep": "70100", "ps": "LONG", "up": "0.26642823"}],
+            },
+        },
+        "v3",
+    )
+    expected_balance = 116.82105510 + 0.12785969 + 0.00000064 + 0.26642823
+    assert bot._ws_balance_cache == pytest.approx(expected_balance)
+    assert bot.balance == pytest.approx(expected_balance)
+    assert bot._ws_balance_assets_cache["USDF"]["wb"] == "116.82105510"
+    assert bot._ws_balance_assets_cache["USDT"]["wb"] == "0.12785969"
+    bot.handle_balance_update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_handle_private_order_trade_update_updates_order_cache_and_ws_fill_cache():
     bot = _make_bot()
     bot.handle_order_update = MagicMock()
