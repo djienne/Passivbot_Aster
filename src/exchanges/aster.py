@@ -730,6 +730,11 @@ class AsterBot(Passivbot):
             fill_event = self._build_fill_event_from_ws_order(order_data, event_time)
             if fill_event is not None:
                 self.execution_scheduled = True
+                await self.maybe_capture_divergence_snapshot(
+                    "fill_event",
+                    extra={"fill_event": fill_event, "mode": mode},
+                    force=True,
+                )
             self.handle_order_update([normalized_order])
         elif event_type == "ACCOUNT_CONFIG_UPDATE":
             ac = payload.get("ac", {}) if isinstance(payload.get("ac"), dict) else {}

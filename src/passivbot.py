@@ -83,6 +83,7 @@ from procedures import (
 from utils import get_file_mod_ms
 from downloader import compute_per_coin_warmup_minutes
 import re
+from pure_funcs import denumpyize
 
 # Orchestrator-only: ideal orders are computed via Rust orchestrator (JSON API).
 # Legacy Python order calculation paths are removed in this branch.
@@ -543,6 +544,15 @@ class Passivbot(ExchangeInterface):
         self._health_rate_limits = 0
         self._health_last_summary_ms = 0
         self._health_summary_interval_ms = 15 * 60 * 1000  # 15 minutes
+        self._last_orchestrator_snapshot = None
+        self._last_replay_snapshot = None
+        self._last_orchestrator_snapshot_ts = 0
+        self._debug_snapshot_seq = 0
+        self._debug_snapshot_last_ms = {}
+        self._debug_snapshot_lock = asyncio.Lock()
+        self._debug_snapshot_dir = make_get_filepath(
+            f"caches/{self.exchange}/{self.user}_snapshots/"
+        )
 
     def live_value(self, key: str):
         return require_live_value(self.config, key)
@@ -1443,6 +1453,25 @@ class Passivbot(ExchangeInterface):
         elif self.balance < self.balance_threshold or not self._check_minimum_balance():
             if self.balance < self.balance_threshold:
                 logging.info("[balance] too low: %.2f %s; not creating orders", self.balance, self.quote)
+                await self.maybe_capture_divergence_snapshot(
+                    "low_balance_block",
+                    extra={
+                        "balance": self.balance,
+                        "balance_threshold": self.balance_threshold,
+                        "requested_orders": to_create,
+                    },
+                    throttle_ms=30_000,
+                )
+            else:
+                await self.maybe_capture_divergence_snapshot(
+                    "minimum_balance_block",
+                    extra={
+                        "balance": self.balance,
+                        "effective_min_cost": getattr(self, "effective_min_cost", {}),
+                        "requested_orders": to_create,
+                    },
+                    throttle_ms=30_000,
+                )
         else:
             # to_create_mod = [x for x in to_create if not order_has_match(x, to_cancel)]
             to_create_mod = []
@@ -1529,6 +1558,11 @@ class Passivbot(ExchangeInterface):
             for elm in to_return:
                 self.add_new_order(elm, source="POST")
             self._health_orders_placed += len(to_return)
+            await self.maybe_capture_divergence_snapshot(
+                "order_post_burst",
+                extra={"orders": to_return, "count": len(to_return)},
+                throttle_ms=2_000,
+            )
         return to_return
 
     async def execute_cancellations_parent(self, orders: [dict]) -> [dict]:
@@ -1589,6 +1623,11 @@ class Passivbot(ExchangeInterface):
             for elm in to_return:
                 self.remove_order(elm, source="POST")
             self._health_orders_cancelled += len(to_return)
+            await self.maybe_capture_divergence_snapshot(
+                "order_cancel_burst",
+                extra={"orders": to_return, "count": len(to_return)},
+                throttle_ms=2_000,
+            )
         return to_return
 
     def log_order_action(
@@ -2444,6 +2483,15 @@ class Passivbot(ExchangeInterface):
     async def handle_balance_update(self, source="REST"):
         if not hasattr(self, "_previous_balance"):
             self._previous_balance = 0.0
+        old_balance = float(self._previous_balance)
+        new_balance = float(self.balance)
+        suspicious = False
+        if old_balance > 0.0:
+            delta_pct = abs(new_balance - old_balance) / max(abs(old_balance), 1.0)
+            suspicious = (
+                (str(source).startswith("WS") and old_balance > 10.0 and new_balance < max(1.0, old_balance * 0.25))
+                or delta_pct >= 0.25
+            )
         if self.balance != self._previous_balance:
             try:
                 equity = self.balance + (await self.calc_upnl_sum())
@@ -2456,6 +2504,16 @@ class Passivbot(ExchangeInterface):
             finally:
                 self._previous_balance = self.balance
                 self.execution_scheduled = True
+                if suspicious:
+                    await self.maybe_capture_divergence_snapshot(
+                        "suspicious_balance_update",
+                        extra={
+                            "source": source,
+                            "old_balance": old_balance,
+                            "new_balance": new_balance,
+                        },
+                        throttle_ms=15_000,
+                    )
 
     async def calc_upnl_sum(self):
         """Compute unrealised PnL across fetched positions using latest prices."""
@@ -3821,6 +3879,7 @@ class Passivbot(ExchangeInterface):
 
         if not changed:
             return
+        snapshot_changes = []
 
         # Pre-calculate total WE per side for TWEL% display
         # Use a meaningful balance threshold to avoid nonsensical WE values
@@ -3904,6 +3963,18 @@ class Passivbot(ExchangeInterface):
             twel = float(self.bot_value(pside, "total_wallet_exposure_limit") or 0.0)
             twel_pct = round(total_we_by_pside[pside] / twel * 100) if twel > 0.0 else 0
             wel_str = f"| {wel_pct:3d}% WEL, {wele_pct:3d}% WELe, {twel_pct:3d}% TWEL |"
+            snapshot_changes.append(
+                {
+                    "symbol": symbol,
+                    "position_side": pside,
+                    "action": action.strip(),
+                    "old": old,
+                    "new": new,
+                    "wallet_exposure": wallet_exposure,
+                    "pa_dist": pprice_diff,
+                    "upnl": upnl,
+                }
+            )
             table.add_row(
                 [
                     action + " ",
@@ -3930,6 +4001,11 @@ class Passivbot(ExchangeInterface):
         # Print aligned table with [pos] prefix
         for line in table.get_string().splitlines():
             logging.info("[pos] %s", line)
+        await self.maybe_capture_divergence_snapshot(
+            "position_change",
+            extra={"changes": snapshot_changes},
+            throttle_ms=2_000,
+        )
 
     async def _fetch_and_apply_positions(self):
         """Fetch raw positions, apply them to local state and return snapshots.
@@ -4560,15 +4636,36 @@ class Passivbot(ExchangeInterface):
         ideal_orders_f, _wel_blocked = self._to_executable_orders(ideal_orders, last_prices)
         ideal_orders_f = self._finalize_reduce_only_orders(ideal_orders_f, last_prices)
 
-        if return_snapshot:
-            snapshot = {
-                "ts_ms": int(utc_ms()),
-                "exchange": str(getattr(self, "exchange", "")),
-                "user": str(self.config_get(["live", "user"]) or ""),
-                "active_symbols": list(symbols),
-                "orchestrator_input": input_dict,
-                "orchestrator_output": out,
+        snapshot = {
+            "ts_ms": int(utc_ms()),
+            "exchange": str(getattr(self, "exchange", "")),
+            "user": str(self.config_get(["live", "user"]) or ""),
+            "active_symbols": list(symbols),
+            "orchestrator_input": input_dict,
+            "orchestrator_output": out,
+            "executable_orders": deepcopy(ideal_orders_f),
+        }
+        self._last_orchestrator_snapshot = denumpyize(deepcopy(snapshot))
+        self._last_replay_snapshot = denumpyize(
+            {
+                "symbols": list(symbols),
+                "last_prices": last_prices,
+                "m1_close_emas": m1_close_emas,
+                "m1_volume_emas": m1_volume_emas,
+                "m1_log_range_emas": m1_log_range_emas,
+                "h1_log_range_emas": h1_log_range_emas,
+                "unstuck_allowances": unstuck_allowances,
+                "balance": self.balance,
+                "positions": deepcopy(self.positions),
+                "fetched_positions": deepcopy(self.fetched_positions),
+                "open_orders": deepcopy(self.open_orders),
+                "trailing_prices": deepcopy(getattr(self, "trailing_prices", {})),
+                "PB_modes": deepcopy(self.PB_modes),
             }
+        )
+        self._last_orchestrator_snapshot_ts = snapshot["ts_ms"]
+
+        if return_snapshot:
             return ideal_orders_f, snapshot
         return ideal_orders_f
 
@@ -5076,6 +5173,188 @@ class Passivbot(ExchangeInterface):
                 except Exception as e:
                     logging.error(f"debug failed to dump to disk {k} {e}")
             self.tmp_debug_ts = utc_ms()
+
+    def _divergence_snapshots_enabled(self) -> bool:
+        """Return True when lightweight replay snapshots should be captured."""
+        return getattr(self, "exchange", "") == "aster"
+
+    def _get_divergence_snapshot_symbols(self, limit: int = 8) -> list[str]:
+        symbols = set(getattr(self, "active_symbols", []) or [])
+        symbols.update(getattr(self, "open_orders", {}).keys())
+        for symbol, sides in getattr(self, "positions", {}).items():
+            if any(float(sides.get(pside, {}).get("size", 0.0) or 0.0) != 0.0 for pside in ("long", "short")):
+                symbols.add(symbol)
+        return sorted(symbols)[:limit]
+
+    def _build_divergence_exchange_state(self, symbols: list[str]) -> dict:
+        tickers = getattr(self, "tickers", {}) if isinstance(getattr(self, "tickers", {}), dict) else {}
+        ws_tickers = (
+            getattr(self, "_ws_tickers_cache", {})
+            if isinstance(getattr(self, "_ws_tickers_cache", {}), dict)
+            else {}
+        )
+        exchange_state = {
+            "tickers": {sym: tickers.get(sym) for sym in symbols if sym in tickers},
+            "ws_tickers": {sym: ws_tickers.get(sym) for sym in symbols if sym in ws_tickers},
+        }
+        optional_attrs = [
+            "_ws_balance_cache",
+            "_ws_balance_cache_ts",
+            "_ws_positions_cache",
+            "_ws_positions_cache_ts",
+            "_ws_open_orders_cache",
+            "_ws_open_orders_cache_ts",
+            "_ws_tickers_cache_ts",
+            "_health_ws_reconnects",
+            "_ws_watchdog_backoff",
+            "_health_errors",
+        ]
+        for attr in optional_attrs:
+            if hasattr(self, attr):
+                exchange_state[attr] = getattr(self, attr)
+        if hasattr(self, "_ws_fill_events_cache") and isinstance(self._ws_fill_events_cache, dict):
+            fills_tail = sorted(
+                self._ws_fill_events_cache.values(),
+                key=lambda x: x.get("timestamp", 0),
+            )[-20:]
+            exchange_state["ws_fill_events_tail"] = fills_tail
+        return exchange_state
+
+    def _build_divergence_snapshot_payload(self, trigger: str, extra: Optional[dict] = None) -> dict:
+        symbols = self._get_divergence_snapshot_symbols()
+        candle_tail = {}
+        for symbol in symbols:
+            try:
+                arr = getattr(self.cm, "_cache", {}).get(symbol)
+                arr_size = getattr(arr, "size", 0)
+                if arr is None or not isinstance(arr_size, (int, np.integer)) or arr_size <= 0:
+                    continue
+                candle_tail[symbol] = denumpyize(arr[-120:])
+            except Exception:
+                continue
+        config_excerpt = {
+            "live": deepcopy(self.config.get("live", {})),
+            "bot": deepcopy(self.config.get("bot", {})),
+        }
+        state = {
+            "balance": float(getattr(self, "balance", 0.0)),
+            "previous_balance": float(getattr(self, "_previous_balance", 0.0)),
+            "active_symbols": list(getattr(self, "active_symbols", []) or []),
+            "positions": deepcopy(getattr(self, "positions", {})),
+            "fetched_positions": deepcopy(getattr(self, "fetched_positions", [])),
+            "open_orders": deepcopy(getattr(self, "open_orders", {})),
+            "fetched_open_orders": deepcopy(getattr(self, "fetched_open_orders", [])),
+            "trailing_prices": {
+                sym: deepcopy(getattr(self, "trailing_prices", {}).get(sym, {})) for sym in symbols
+            },
+            "PB_modes": deepcopy(getattr(self, "PB_modes", {})),
+            "approved_coins": {
+                pside: sorted(list(vals))
+                for pside, vals in getattr(self, "approved_coins", {}).items()
+            },
+            "ignored_coins": {
+                pside: sorted(list(vals))
+                for pside, vals in getattr(self, "ignored_coins", {}).items()
+            },
+            "approved_coins_minus_ignored_coins": {
+                pside: sorted(list(vals))
+                for pside, vals in getattr(self, "approved_coins_minus_ignored_coins", {}).items()
+            },
+            "effective_min_cost": {
+                sym: getattr(self, "effective_min_cost", {}).get(sym) for sym in symbols
+            },
+            "recent_order_executions_tail": deepcopy(getattr(self, "recent_order_executions", [])[-20:]),
+            "recent_order_cancellations_tail": deepcopy(
+                getattr(self, "recent_order_cancellations", [])[-20:]
+            ),
+            "state_change_detected_by_symbol": sorted(
+                list(getattr(self, "state_change_detected_by_symbol", set()) or set())
+            ),
+        }
+        market_settings = {
+            sym: {
+                "qty_step": getattr(self, "qty_steps", {}).get(sym),
+                "price_step": getattr(self, "price_steps", {}).get(sym),
+                "min_qty": getattr(self, "min_qtys", {}).get(sym),
+                "min_cost": getattr(self, "min_costs", {}).get(sym),
+                "c_mult": getattr(self, "c_mults", {}).get(sym),
+            }
+            for sym in symbols
+        }
+        return {
+            "meta": {
+                "ts_ms": int(utc_ms()),
+                "datetime": ts_to_date(utc_ms()),
+                "trigger": str(trigger),
+                "exchange": str(getattr(self, "exchange", "")),
+                "user": str(getattr(self, "user", "")),
+            },
+            "extra": deepcopy(extra or {}),
+            "config": config_excerpt,
+            "state": state,
+            "market_settings": market_settings,
+            "candle_tail_1m": candle_tail,
+            "exchange_state": self._build_divergence_exchange_state(symbols),
+            "last_orchestrator_snapshot": deepcopy(getattr(self, "_last_orchestrator_snapshot", None)),
+            "last_replay_snapshot": deepcopy(getattr(self, "_last_replay_snapshot", None)),
+            "last_orchestrator_snapshot_age_ms": (
+                int(utc_ms() - self._last_orchestrator_snapshot_ts)
+                if getattr(self, "_last_orchestrator_snapshot_ts", 0)
+                else None
+            ),
+        }
+
+    def _prune_divergence_snapshots(self, max_files: int = 200) -> None:
+        try:
+            files = sorted(Path(self._debug_snapshot_dir).glob("*.json"))
+            if len(files) <= max_files:
+                return
+            for fpath in files[: len(files) - max_files]:
+                try:
+                    fpath.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    async def maybe_capture_divergence_snapshot(
+        self,
+        trigger: str,
+        extra: Optional[dict] = None,
+        *,
+        throttle_ms: int = 0,
+        force: bool = False,
+    ) -> Optional[str]:
+        """Persist a replay-oriented debug snapshot for suspicious live events."""
+        if not self._divergence_snapshots_enabled():
+            return None
+        now = utc_ms()
+        if not force:
+            last = self._debug_snapshot_last_ms.get(trigger, 0)
+            if throttle_ms > 0 and now - last < throttle_ms:
+                return None
+        self._debug_snapshot_last_ms[trigger] = now
+        try:
+            async with self._debug_snapshot_lock:
+                self._debug_snapshot_seq += 1
+                payload = self._build_divergence_snapshot_payload(trigger, extra=extra)
+                slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(trigger)).strip("_")[:64] or "snapshot"
+                fpath = os.path.join(
+                    self._debug_snapshot_dir,
+                    f"{now}_{self._debug_snapshot_seq:04d}_{slug}.json",
+                )
+
+                def _write():
+                    with open(fpath, "w") as f:
+                        json.dump(denumpyize(payload), f, indent=2)
+
+                await asyncio.to_thread(_write)
+                await asyncio.to_thread(self._prune_divergence_snapshots)
+                logging.info("[debug] saved divergence snapshot: %s", fpath)
+                return fpath
+        except Exception as exc:
+            logging.warning("[debug] failed to save divergence snapshot for %s: %s", trigger, exc)
+            return None
 
     # Legacy EMA maintenance (init_EMAs_single/update_EMAs) removed in favor of CandlestickManager
 
