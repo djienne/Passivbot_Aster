@@ -17,7 +17,7 @@ from exchanges.aster_rest import (
     aster_symbol_to_passivbot_symbol,
 )
 from exchanges.aster_ws import AsterWebsocketConfig, AsterWebsocketManager
-from passivbot import Passivbot, custom_id_to_snake, logging
+from passivbot import Passivbot, custom_id_to_snake, logging, round_
 from utils import utc_ms
 
 
@@ -732,6 +732,9 @@ class AsterBot(Passivbot):
             return
         if event_time:
             self._ws_ticker_event_times[symbol] = event_time
+        # Public bookTicker updates are a valid liveness signal even when the
+        # private user stream is quiet on an unchanged account.
+        self._ws_last_message_ms = utc_ms()
         bid = _safe_float(payload.get("b") or payload.get("bidPrice") or payload.get("bid"))
         ask = _safe_float(payload.get("a") or payload.get("askPrice") or payload.get("ask"))
         if bid < 0.0 or ask < 0.0:
@@ -856,19 +859,33 @@ class AsterBot(Passivbot):
         return await self.fetch_fill_events(start_time=start_time, end_time=end_time, limit=limit)
 
     async def execute_order(self, order: dict) -> dict:
-        validation_error = self._validate_order(order)
+        normalized_order = dict(order)
+        qty = abs(float(normalized_order["qty"]))
+        qty_step = float(self.qty_steps.get(normalized_order["symbol"], 0.0) or 0.0)
+        if qty_step > 0.0:
+            qty = float(round_(qty, qty_step))
+        normalized_order["qty"] = qty
+
+        if normalized_order.get("price") is not None:
+            price = float(normalized_order["price"])
+            price_step = float(self.price_steps.get(normalized_order["symbol"], 0.0) or 0.0)
+            if price_step > 0.0:
+                price = float(round_(price, price_step))
+            normalized_order["price"] = price
+
+        validation_error = self._validate_order(normalized_order)
         if validation_error:
-            logging.warning("Aster order skipped: %s | %s", validation_error, order)
+            logging.warning("Aster order skipped: %s | %s", validation_error, normalized_order)
             return {}
         created = await self.cca.create_order(
-            symbol=order["symbol"],
-            type=order.get("type", "limit"),
-            side=order["side"],
-            amount=abs(float(order["qty"])),
-            price=float(order["price"]) if order.get("price") is not None else None,
-            params=self.get_order_execution_params(order),
+            symbol=normalized_order["symbol"],
+            type=normalized_order.get("type", "limit"),
+            side=normalized_order["side"],
+            amount=qty,
+            price=float(normalized_order["price"]) if normalized_order.get("price") is not None else None,
+            params=self.get_order_execution_params(normalized_order),
         )
-        return self._normalize_order_response(created, order=order)
+        return self._normalize_order_response(created, order=normalized_order)
 
     async def execute_cancellation(self, order: dict) -> dict:
         try:
@@ -889,6 +906,8 @@ class AsterBot(Passivbot):
             raise
 
     def did_create_order(self, executed) -> bool:
+        if not isinstance(executed, dict):
+            return False
         return bool(
             executed
             and (

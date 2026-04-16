@@ -20,6 +20,7 @@ from exchanges.aster_ws import AsterWebsocketConfig, _exponential_backoff_delay
 from exchanges.aster_rest import (
     ASTER_DEFAULT_BASE_URL,
     ASTER_DEFAULT_WS_URL,
+    AsterAPIError,
     AsterConfiguration,
     translate_aster_exchange_info,
 )
@@ -389,6 +390,46 @@ async def test_execute_order_uses_post_only_gtx_and_normalizes_response():
     assert bot.cca.create_order.await_args.kwargs["params"]["positionSide"] == "BOTH"
     assert result["id"] == "987"
     assert result["symbol"] == "BTC/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_execute_order_quantizes_price_and_qty_before_submit():
+    bot = _make_bot()
+    bot.config["live"]["time_in_force"] = "post_only"
+    bot.cca.create_order = AsyncMock(
+        return_value={
+            "symbol": "BTCUSDT",
+            "orderId": 988,
+            "clientOrderId": "cid-988",
+            "side": "BUY",
+            "positionSide": "BOTH",
+            "origQty": "0.123",
+            "price": "70000.1",
+            "status": "NEW",
+            "time": 1710002000001,
+        }
+    )
+    await bot.execute_order(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 0.1230000004,
+            "price": 70000.1000000001,
+            "type": "limit",
+            "reduce_only": False,
+            "custom_id": "cid-988",
+        }
+    )
+    call_kwargs = bot.cca.create_order.await_args.kwargs
+    assert call_kwargs["amount"] == pytest.approx(0.123)
+    assert call_kwargs["price"] == pytest.approx(70000.1)
+    assert call_kwargs["params"]["timeInForce"] == "GTX"
+
+
+def test_did_create_order_returns_false_for_exception_objects():
+    bot = _make_bot()
+    assert bot.did_create_order(AsterAPIError("boom")) is False
 
 
 @pytest.mark.asyncio
