@@ -1,96 +1,88 @@
 ![Passivbot](docs/images/pbot_logo_full.svg)
 
-# Passivbot - Aster-Focused Fork
+# Passivbot - Aster Fork
 
-> **Video tutorial:** Watch the associated walkthrough on YouTube: https://youtu.be/E87Pbgfosoo
+This is a heavily modified fork of [Passivbot](https://github.com/enarjord/passivbot) intended and documented for **Aster perpetuals only**.
 
-A fork of [Passivbot](https://github.com/enarjord/passivbot) focused on **Aster perpetuals (Pro API / V3)**, while still retaining the custom [Lighter](https://lighter.xyz) connector.
+The main Aster advantage for this fork is simple: **0 maker fees**. Passivbot works best as a maker-style bot that keeps posting and refreshing passive limit orders, so Aster's fee model is a strong fit for how this strategy is meant to run.
 
-This repo now supports:
+This repo still contains a legacy [Lighter](https://lighter.xyz) connector, but treat it as secondary. The README, default configs, Docker setup, and active exchange work in this fork are all aimed at Aster.
 
-- **Aster** as the main actively integrated exchange path
-- **Lighter** as a retained custom connector path
-- historical candle download, backtesting, and live trading flows around those integrations
+:warning: **Use at your own risk** :warning:
 
-:warning: **Used at one's own risk** :warning:
-
-> **Deployment note:** A Linux VPS is recommended. Python 3.12 is required for this repo version.
+> **Deployment note:** Docker or a Linux VPS is recommended for live use.
 >
-> **Lighter-specific note:** the `lighter` SDK still requires Linux for signing. That Linux-only restriction is about the Lighter connector, not the Aster integration in general.
+> **Python version policy:** Use **Python 3.12 only** for this repo. Do not use Python 3.10, 3.11, or 3.13.
 
-<p align="center">
-  <img src="account.png" alt="Lighter account type selection showing that Simple Trading Account should be used instead of Unified Trading Account (UTA)" width="900" />
-</p>
-
-v7.8.4
+Upstream base: `v7.8.4`
 
 ## Fork Overview
 
-> :warning: This is a **heavily modified fork** of [enarjord/passivbot](https://github.com/enarjord/passivbot) (v7.8.4). It is **not a drop-in replacement** for upstream passivbot. The current focus of this fork is Aster perpetuals, with Lighter still supported as a custom connector.
+> :warning: This is a **heavily modified fork** of [enarjord/passivbot](https://github.com/enarjord/passivbot) (`v7.8.4`). It is **not a drop-in replacement** for upstream passivbot. The supported and documented path in this fork is Aster Pro / V3.
 
 Key changes from upstream:
 
-- **Aster connector** — V3/Pro API integration for REST, websocket state, fill events, and historical candle flows.
-- **Backtesting integration** — Aster candle download and backtesting support wired into the repo’s standard HLCV preparation paths.
-- **Lighter connector retained** — the custom Lighter integration still exists and should continue to work.
-- **Docker support** — `Dockerfile_live` and `docker-compose.yml` now default to a generic live container path and can target Aster configs directly.
-- **Python 3.12-only runtime** — this repo version should be run on Python 3.12.
+- **Aster connector** - V3/Pro API integration for REST, websocket state, fill events, and historical candle flows.
+- **Backtesting integration** - Aster candle download and backtesting support wired into the repo's standard HLCV preparation paths.
+- **Docker defaults for Aster** - `docker-compose.yml` starts `passivbot-aster-live` with `configs/config_hype_aster.json` by default.
+- **Python 3.12-only runtime** - this repo version should be run on Python 3.12.
+- **Lighter code retained** - the legacy Lighter path is still in-tree, but it is no longer the main target of docs or default deployment examples.
 
-## Exchange Focus
+## Why Aster
 
-- **Primary focus:** Aster perpetuals via Pro API / V3
-- **Still supported:** Lighter
-- **Do not assume upstream exchange parity:** this fork is custom and diverges significantly from upstream
+- **Intended exchange:** Aster perpetuals via Pro API / V3.
+- **Main economic advantage:** Aster currently offers `0 maker fees`.
+- **Best fit for Passivbot:** Passivbot is designed around repeatedly posting and refreshing passive orders rather than chasing price with taker entries.
+- **Strict maker-only recommendation:** if you want the bot to stay maker-only, set `time_in_force` to `post_only` and `market_orders_allowed` to `false` in your live config before going live.
+- **Important accuracy note:** the shipped example configs are Aster-focused, but they are not all locked to strict maker-only defaults out of the box.
+- **Do not assume upstream exchange parity:** this fork is custom and diverges significantly from upstream.
 
 ## Overview
 
 Passivbot is a cryptocurrency trading bot written in Python and Rust, intended to require minimal user intervention.
 
-It operates on perpetual futures derivatives markets, automatically creating and cancelling limit buy and sell orders on behalf of the user. It does not try to predict future price movements, it does not use technical indicators, nor does it follow trends. Rather, it is a contrarian market maker, providing resistance to price changes in both directions, thereby "serving the market" as a price stabilizer.
+It operates on perpetual futures derivatives markets, automatically creating and cancelling limit buy and sell orders on behalf of the user. It does not try to predict future price movements, it does not use technical indicators, nor does it follow trends. Rather, it is a contrarian market maker, providing resistance to price changes in both directions.
 
-Passivbot's behavior may be backtested on historical price data, using the included backtester whose CPU heavy functions are written in Rust for speed. Also included is an optimizer, which finds better configurations by iterating thousands of backtests with different candidates, converging on the optimal ones with an evolutionary algorithm.
+Passivbot's behavior may be backtested on historical price data, using the included backtester whose CPU-heavy functions are written in Rust for speed. Also included is an optimizer, which finds better configurations by iterating thousands of backtests with different candidates, converging on the optimal ones with an evolutionary algorithm.
 
 ## Strategy
 
-Inspired by the Martingale betting strategy, the robot will make a small initial entry and double down on its losing positions multiple times to bring the average entry price closer to current price action. The orders are placed in a grid, ready to absorb sudden price movements. After each re-entry, the robot quickly updates its closing orders at a set take-profit markup. This way, if there is even a minor market reversal, or "bounce", the position can be closed in profit, and it starts over.
+Inspired by the Martingale betting strategy, the bot will make a small initial entry and double down on losing positions multiple times to bring the average entry price closer to current price action. Orders are placed in a grid, ready to absorb sudden price movements. After each re-entry, the bot updates its closing orders at a set take-profit markup so that even a modest reversal may allow the position to be closed in profit.
 
 ### Trailing Orders
-In addition to grid-based entries and closes, Passivbot may be configured to utilize trailing entries and trailing closes.
 
-For trailing entries, the bot waits for the price to move beyond a specified threshold and then retrace by a defined percentage before placing a re-entry order. Similarly, for trailing closes, the bot waits before placing its closing orders until after the price has moved favorably by a threshold percentage and then retraced by a specified percentage. This may result in the bot locking in profits more effectively by exiting positions when the market shows signs of reversing instead of at a fixed distance from average entry price.
+In addition to grid-based entries and closes, Passivbot may be configured to use trailing entries and trailing closes.
 
-Grid and trailing orders may be combined, such that the robot enters or closes a whole or a part of the position as grid orders and/or as trailing orders.
+For trailing entries, the bot waits for price to move beyond a specified threshold and then retrace by a defined percentage before placing a re-entry order. For trailing closes, the bot waits before placing closing orders until after price has moved favorably by a threshold percentage and then retraced by a specified percentage.
 
 ### Forager
-The Forager feature dynamically chooses the most volatile markets on which to open positions. Volatility is defined as the EMA of the log range for the most recent 1m candles, i.e. `EMA(ln(high / low))`.
+
+The Forager feature dynamically chooses the most volatile markets on which to open positions. Volatility is defined as the EMA of the log range for the most recent 1-minute candles, i.e. `EMA(ln(high / low))`.
 
 ### Unstucking Mechanism
-Passivbot manages underperforming, or "stuck", positions by realizing small losses over time. If multiple positions are stuck, the bot prioritizes positions with the smallest gap between the entry price and current market price for "unstucking". Losses are limited by ensuring that the account balance does not fall under a set percentage below the past peak balance.
+
+Passivbot manages underperforming, or "stuck", positions by realizing small losses over time. If multiple positions are stuck, the bot prioritizes positions with the smallest gap between the entry price and current market price for unstucking. Losses are limited by ensuring that the account balance does not fall under a set percentage below the past peak balance.
+
+### Maker-Only Note
+
+This fork is best understood as an **Aster maker-strategy fork**. If you intentionally leave market-order fallbacks enabled, you are changing the fee assumptions and drifting away from the main reason this Aster fork exists.
 
 ## Quickstart
 
 ### Prerequisites
-- Linux VPS recommended
+
+- Docker Desktop or a Linux VPS recommended for live use
 - Python 3.12
-- Rust >= 1.90 (only needed when running without Docker; Docker builds Rust automatically)
-- Docker & Docker Compose (for containerized deployment)
+- Rust >= 1.90 only if running without Docker
+- Docker & Docker Compose for the recommended deployment path
 - An Aster Pro API setup for Aster trading
+- Need an Aster account? Use the referral link and support this work: https://www.asterdex.com/en/referral/164f81
 
-> **Python version policy:** Use **Python 3.12 only** for this version of Passivbot. Do not use Python 3.10, 3.11, or 3.13 for this repo.
-
-### 1. Clone & Install
-
-```bash
-git clone <this-repo> passivbot_lighter
-cd passivbot_lighter
-pip install -r requirements-live.txt
-```
-
-If you use Conda, the repo now includes a pinned environment file:
+### 1. Clone
 
 ```bash
-conda env create -f environment.yml
-conda activate passivbot
+git clone <this-repo> passivbot_aster
+cd passivbot_aster
 ```
 
 ### 2. Configure API Keys
@@ -101,70 +93,112 @@ Copy the example and fill in your Aster credentials:
 cp api-keys.json.example api-keys.json
 ```
 
-Edit `api-keys.json` — find the `aster_01` entry and set:
+Edit `api-keys.json` and update the `aster_01` entry:
+
+- `exchange = "aster"`
 - `api_user`
 - `api_signer`
 - `api_private_key`
+- optional: `balance_mode`
 
 See also:
+
 - [docs/aster_live.md](docs/aster_live.md)
 
 ### 3. Run with Docker (recommended)
 
 ```bash
-docker compose up -d                        # start passivbot-live
-docker logs -f passivbot-live               # follow logs
-docker compose down                         # stop
+docker compose up -d
+docker logs -f passivbot-aster-live
+docker compose down
+```
+
+By default, `docker-compose.yml` launches `passivbot-aster-live` with `configs/config_hype_aster.json`.
+
+If you want strict maker-only behavior on Aster, review the chosen config before launch and set:
+
+```json
+"time_in_force": "post_only",
+"market_orders_allowed": false
 ```
 
 ### 4. Run directly (without Docker)
 
 ```bash
-python src/main.py configs/hype_top_aster.json
+pip install -r requirements-live.txt
+python src/main.py configs/config_hype_aster.json
 ```
 
-### Logging
+If you use Conda, the repo also includes a pinned environment file:
+
+```bash
+conda env create -f environment.yml
+conda activate passivbot
+```
+
+## Logging
 
 Passivbot uses Python's logging module throughout the bot, backtester, and supporting tools.
-- Use `--log-level` on `src/main.py` or `src/backtest.py` to adjust verbosity at runtime. Accepts `warning`, `info`, `debug`, `trace` or numeric `0-3` (`0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`). You can also use `-v` / `--verbose` as a shorthand for `--log-level debug`.
-- Persist a default by adding a top-level section to your config: `"logging": {"level": 2}`. The CLI flag always overrides the config value for that run.
-- CandlestickManager and other subsystems inherit the chosen level so EMA warm-up, data fetching, and cache behaviour can be inspected consistently.
 
-### Running Multiple Bots
+- Use `--log-level` on `src/main.py` or `src/backtest.py` to adjust verbosity at runtime. Accepts `warning`, `info`, `debug`, `trace` or numeric `0-3` (`0 = warnings only`, `1 = info`, `2 = debug`, `3 = trace`).
+- You can also use `-v` or `--verbose` as a shorthand for `--log-level debug`.
+- Persist a default by adding a top-level section to your config: `"logging": {"level": 2}`.
+- The CLI flag always overrides the config value for that run.
 
-Running several Passivbot instances against the same exchange on one machine is supported. Each process shares the same on-disk OHLCV cache, and the candlestick manager now uses short-lived, self-healing locks with automatic stale cleanup so that one stalled process cannot block the rest. No manual deletion of lock files is required; the bot removes stale locks on startup and logs whenever a lock acquisition times out.
+## Running Multiple Bots
+
+Running several Passivbot instances against the same exchange on one machine is supported. Each process shares the same on-disk OHLCV cache, and the candlestick manager uses short-lived, self-healing locks with automatic stale cleanup so that one stalled process cannot block the rest.
+
+If you run multiple Dockerized bots, do not reuse the compose file unchanged. Give each stack its own:
+
+- `container_name`
+- image name
+- config path
+- account / API credential set
 
 ## Requirements
 
 - Python 3.12
-- Rust >= 1.90 (for building the backtesting extension; handled automatically when using Docker)
+- Rust >= 1.90 for building the backtesting extension outside Docker
 - [requirements-live.txt](requirements-live.txt) dependencies
 
-## Lighter Notes
+## Lighter Status
 
-Lighter support is still present in this repo, but it is no longer the main focus of the README or the default Docker/config examples.
+Lighter support is still present in this repo, but from the perspective of this README it is a **legacy path**.
 
-If you use Lighter:
+If you use Lighter anyway:
 
 - use a **Simple Trading Account**
-- run on Linux / WSL / Docker
+- run on Linux, WSL, or Docker
 - review the retained `lighter_01` entry in `api-keys.json.example`
 
-## Pre-optimized configurations
+## Pre-optimized Configurations
 
-Coming soon...
+Coming soon.
 
-See also https://pbconfigdb.scud.dedyn.io/
+See also: https://pbconfigdb.scud.dedyn.io/
 
-## Documentation:
+## Documentation
 
-For more detailed information about Passivbot, see documentation files here: [docs/](docs/)
+For more detailed information about this fork, start with:
 
-## Third Party Links and Tip Jar
+- [docs/aster_live.md](docs/aster_live.md)
+- [docs/installation.md](docs/installation.md)
+- [docs/live.md](docs/live.md)
+- [docs/](docs/)
+
+## Third Party Links and Support
+
+For this fork specifically, the Aster referral link above is the simplest way to support ongoing Aster work.
 
 **Passivbot GUI**
+
 A graphical user interface for Passivbot:
 https://github.com/msei99/pbgui
+
+**Upstream support links**
+
+The donation links below are inherited from upstream Passivbot:
 
 **BuyMeACoffee:**
 https://www.buymeacoffee.com/enarjord
@@ -181,6 +215,7 @@ Bitcoin (BTC) via Strike:
 enarjord@strike.me
 
 ## License
+
 This is free and unencumbered software released into the public domain.
 
 Anyone is free to copy, modify, publish, use, compile, sell, or

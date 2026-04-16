@@ -3,9 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile_live
-    image: passivbot-live:latest
-    container_name: passivbot-live
+    image: passivbot-aster-live:latest
+    container_name: passivbot-aster-live
     restart: unless-stopped
+    network_mode: bridge
     volumes:
       - ./:/app/
     working_dir: /app
