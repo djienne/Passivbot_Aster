@@ -7,6 +7,10 @@ services:
     container_name: passivbot-aster-live
     restart: unless-stopped
     network_mode: bridge
+    mem_limit: 512m
+    memswap_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
     volumes:
       - ./:/app/
     working_dir: /app
@@ -18,10 +22,6 @@ services:
       - sh
       - -lc
       - python src/main.py "$${PASSIVBOT_CONFIG}" $${PASSIVBOT_ARGS}
-    deploy:
-      resources:
-        limits:
-          memory: 512M
     logging:
       driver: json-file
       options:
