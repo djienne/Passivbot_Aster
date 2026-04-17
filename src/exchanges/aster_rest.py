@@ -530,7 +530,16 @@ class AsterRestClient:
                     data=data,
                     headers=headers,
                 )
-            except Exception as exc:
+            except AsterAPIError:
+                # Do not retry server-authoritative errors across paths — the
+                # request may have been accepted and a retry on another path
+                # could double-submit an order.
+                raise
+            except (
+                aiohttp.ClientConnectorError,
+                aiohttp.ServerDisconnectedError,
+                asyncio.TimeoutError,
+            ) as exc:
                 last_error = exc
                 await asyncio.sleep(0)
         if last_error is None:
@@ -554,24 +563,39 @@ class AsterRestClient:
         params: Optional[dict[str, Any]] = None,
     ) -> Any:
         async with self._private_request_lock:
-            signed_params = self._sign_v3_params(params)
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "User-Agent": "Passivbot/aster",
             }
-            if method.upper() == "GET":
-                return await self._request_json_with_fallback(
-                    method,
-                    paths,
-                    params=signed_params,
-                    headers=headers,
-                )
-            return await self._request_json_with_fallback(
-                method,
-                paths,
-                data=signed_params,
-                headers=headers,
-            )
+            last_error: Optional[Exception] = None
+            for path in paths:
+                signed_params = self._sign_v3_params(params)
+                try:
+                    if method.upper() == "GET":
+                        return await self._request_json(
+                            method,
+                            path,
+                            params=signed_params,
+                            headers=headers,
+                        )
+                    return await self._request_json(
+                        method,
+                        path,
+                        data=signed_params,
+                        headers=headers,
+                    )
+                except AsterAPIError:
+                    raise
+                except (
+                    aiohttp.ClientConnectorError,
+                    aiohttp.ServerDisconnectedError,
+                    asyncio.TimeoutError,
+                ) as exc:
+                    last_error = exc
+                    await asyncio.sleep(0)
+            if last_error is None:
+                raise RuntimeError("Aster private request failed before attempting any path")
+            raise last_error
 
     async def fetch_exchange_info(self) -> dict[str, Any]:
         payload = await self._public_request_json("GET", ASTER_EXCHANGE_INFO_PATHS)

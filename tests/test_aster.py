@@ -258,7 +258,7 @@ async def test_private_request_json_serializes_signed_private_requests():
     max_active = 0
     seen_nonces = []
 
-    async def fake_request_json_with_fallback(method, paths, *, params=None, data=None, headers=None):
+    async def fake_request_json(method, path, *, params=None, data=None, headers=None):
         nonlocal active, max_active
         payload = params if params is not None else data
         seen_nonces.append(int(payload["nonce"]))
@@ -269,7 +269,7 @@ async def test_private_request_json_serializes_signed_private_requests():
         return {"code": 200}
 
     with patch("exchanges.aster_rest._load_signing_dependencies", return_value=_fake_signing_dependencies()), patch.object(
-        client, "_request_json_with_fallback", side_effect=fake_request_json_with_fallback
+        client, "_request_json", side_effect=fake_request_json
     ):
         await asyncio.gather(
             client._private_request_json("GET", ("/fapi/v3/account",)),
@@ -279,6 +279,69 @@ async def test_private_request_json_serializes_signed_private_requests():
     assert max_active == 1
     assert len(seen_nonces) == 2
     assert seen_nonces[1] > seen_nonces[0]
+
+
+@pytest.mark.asyncio
+async def test_private_request_resigns_per_retry_on_network_error():
+    import aiohttp as _aiohttp
+
+    client = AsterRestClient(
+        AsterConfiguration(
+            api_user=ASTER_USER_INFO["api_user"],
+            api_signer=ASTER_USER_INFO["api_signer"],
+            api_private_key=ASTER_USER_INFO["api_private_key"],
+        )
+    )
+    seen_nonces = []
+    calls = {"n": 0}
+
+    async def fake_request_json(method, path, *, params=None, data=None, headers=None):
+        payload = params if params is not None else data
+        seen_nonces.append(int(payload["nonce"]))
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _aiohttp.ClientConnectorError(
+                connection_key=MagicMock(),
+                os_error=OSError("connect refused"),
+            )
+        return {"code": 200}
+
+    with patch(
+        "exchanges.aster_rest._load_signing_dependencies",
+        return_value=_fake_signing_dependencies(),
+    ), patch.object(client, "_request_json", side_effect=fake_request_json):
+        await client._private_request_json(
+            "GET", ("/fapi/v3/primary", "/fapi/v3/fallback")
+        )
+    assert len(seen_nonces) == 2
+    assert seen_nonces[1] > seen_nonces[0]
+
+
+@pytest.mark.asyncio
+async def test_private_request_does_not_retry_on_aster_api_error():
+    client = AsterRestClient(
+        AsterConfiguration(
+            api_user=ASTER_USER_INFO["api_user"],
+            api_signer=ASTER_USER_INFO["api_signer"],
+            api_private_key=ASTER_USER_INFO["api_private_key"],
+        )
+    )
+    calls = {"n": 0}
+
+    async def fake_request_json(method, path, *, params=None, data=None, headers=None):
+        calls["n"] += 1
+        raise AsterAPIError("insufficient margin", status=400, code=-2019, path=path)
+
+    with patch(
+        "exchanges.aster_rest._load_signing_dependencies",
+        return_value=_fake_signing_dependencies(),
+    ), patch.object(client, "_request_json", side_effect=fake_request_json):
+        with pytest.raises(AsterAPIError) as excinfo:
+            await client._private_request_json(
+                "POST", ("/fapi/v3/order_primary", "/fapi/v3/order_fallback")
+            )
+    assert excinfo.value.code == -2019
+    assert calls["n"] == 1  # the second path must not be tried
 
 
 def test_websocket_config_defaults_follow_credentials():
@@ -513,6 +576,122 @@ def test_did_create_order_returns_false_for_exception_objects():
 
 
 @pytest.mark.asyncio
+async def test_execute_order_rounds_qty_down_and_rejects_zero():
+    bot = _make_bot()
+    bot.cca.create_order = AsyncMock(return_value={})
+    result = await bot.execute_order(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 0.0004,
+            "price": 70000.0,
+            "type": "limit",
+            "reduce_only": False,
+            "custom_id": "cid-rnd-0",
+        }
+    )
+    assert result == {}
+    bot.cca.create_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_order_buy_price_rounds_down():
+    bot = _make_bot()
+    bot.cca.create_order = AsyncMock(
+        return_value={
+            "symbol": "BTCUSDT",
+            "orderId": 100,
+            "clientOrderId": "cid-rnd-1",
+            "side": "BUY",
+            "positionSide": "BOTH",
+            "origQty": "0.001",
+            "price": "70000.1",
+            "status": "NEW",
+            "time": 1710002000001,
+        }
+    )
+    await bot.execute_order(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 0.001,
+            "price": 70000.15,
+            "type": "limit",
+            "reduce_only": False,
+            "custom_id": "cid-rnd-1",
+        }
+    )
+    call_kwargs = bot.cca.create_order.await_args.kwargs
+    assert call_kwargs["price"] == pytest.approx(70000.1)
+
+
+@pytest.mark.asyncio
+async def test_execute_order_sell_price_rounds_up():
+    bot = _make_bot()
+    bot.cca.create_order = AsyncMock(
+        return_value={
+            "symbol": "BTCUSDT",
+            "orderId": 101,
+            "clientOrderId": "cid-rnd-2",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "origQty": "0.001",
+            "price": "70000.2",
+            "status": "NEW",
+            "time": 1710002000001,
+        }
+    )
+    await bot.execute_order(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "sell",
+            "position_side": "long",
+            "qty": 0.001,
+            "price": 70000.15,
+            "type": "limit",
+            "reduce_only": True,
+            "custom_id": "cid-rnd-2",
+        }
+    )
+    call_kwargs = bot.cca.create_order.await_args.kwargs
+    assert call_kwargs["price"] == pytest.approx(70000.2)
+
+
+@pytest.mark.asyncio
+async def test_execute_order_qty_truncates_not_rounds_up():
+    bot = _make_bot()
+    bot.cca.create_order = AsyncMock(
+        return_value={
+            "symbol": "BTCUSDT",
+            "orderId": 102,
+            "clientOrderId": "cid-rnd-3",
+            "side": "BUY",
+            "positionSide": "BOTH",
+            "origQty": "0.009",
+            "price": "70000.0",
+            "status": "NEW",
+            "time": 1710002000001,
+        }
+    )
+    await bot.execute_order(
+        {
+            "symbol": "BTC/USDT:USDT",
+            "side": "buy",
+            "position_side": "long",
+            "qty": 0.0099999,
+            "price": 70000.0,
+            "type": "limit",
+            "reduce_only": False,
+            "custom_id": "cid-rnd-3",
+        }
+    )
+    call_kwargs = bot.cca.create_order.await_args.kwargs
+    assert call_kwargs["amount"] == pytest.approx(0.009)
+
+
+@pytest.mark.asyncio
 async def test_fetch_pnls_fans_out_per_symbol_and_sorts():
     bot = _make_bot()
     bot.positions = {
@@ -591,6 +770,43 @@ async def test_update_exchange_config_by_symbols_clamps_leverage_to_market_max()
 
 
 @pytest.mark.asyncio
+async def test_update_exchange_config_by_symbols_sleeps_between_symbols(monkeypatch):
+    bot = _make_bot()
+    bot.markets_dict["BTC/USDT:USDT"] = bot.markets_dict["BTC/USDT:USDT"]
+    bot.max_leverage["BTC/USDT:USDT"] = 5
+    bot.max_leverage["ETH/USDT:USDT"] = 5
+    bot.cca.change_leverage = AsyncMock(return_value={"leverage": 5})
+    bot.cca.set_margin_type = AsyncMock(return_value={"code": 200})
+    sleep_durations: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def tracking_sleep(duration):
+        sleep_durations.append(duration)
+        await real_sleep(0)
+
+    monkeypatch.setattr("exchanges.aster.asyncio.sleep", tracking_sleep)
+    await bot.update_exchange_config_by_symbols(["BTC/USDT:USDT", "ETH/USDT:USDT"])
+    gap_sleeps = [d for d in sleep_durations if d >= 0.2]
+    assert len(gap_sleeps) >= 1
+
+
+@pytest.mark.asyncio
+async def test_update_exchange_config_by_symbols_treats_code_4046_as_already_set(caplog):
+    import logging as _logging
+
+    bot = _make_bot()
+    bot.max_leverage["BTC/USDT:USDT"] = 5
+    bot.cca.change_leverage = AsyncMock(return_value={"leverage": 5})
+    bot.cca.set_margin_type = AsyncMock(
+        side_effect=AsterAPIError("margin type unchanged", status=400, code=-4046)
+    )
+    with caplog.at_level(_logging.INFO):
+        await bot.update_exchange_config_by_symbols(["BTC/USDT:USDT"])
+    assert any("already set" in rec.message.lower() for rec in caplog.records)
+    assert not any("error setting cross margin" in rec.message.lower() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_handle_private_account_update_refreshes_ws_balance_and_positions():
     bot = _make_bot()
     bot.balance = 0.0
@@ -617,6 +833,131 @@ async def test_handle_private_account_update_refreshes_ws_balance_and_positions(
         }
     ]
     bot.handle_balance_update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminal_order_events_drop_from_order_state_caches():
+    bot = _make_bot()
+    bot.handle_order_update = MagicMock()
+    for order_id in range(3):
+        await bot._handle_private_ws_message(
+            {
+                "e": "ORDER_TRADE_UPDATE",
+                "E": 1710007000000 + order_id,
+                "o": {
+                    "s": "BTCUSDT",
+                    "S": "BUY",
+                    "X": "FILLED",
+                    "i": order_id,
+                    "q": "0.001",
+                    "p": "70000.0",
+                    "z": "0.001",
+                    "l": "0.001",
+                    "L": "70000.0",
+                    "T": 1710007000000 + order_id,
+                },
+            },
+            "v3",
+        )
+    assert bot._ws_order_event_times == {}
+    assert bot._aster_order_detail_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_order_state_caches_bounded_under_flood():
+    bot = _make_bot()
+    bot.handle_order_update = MagicMock()
+    bot._ws_fill_events_max = 100  # tighten cap to keep test fast
+    for order_id in range(2500):
+        await bot._handle_private_ws_message(
+            {
+                "e": "ORDER_TRADE_UPDATE",
+                "E": 1710008000000 + order_id,
+                "o": {
+                    "s": "BTCUSDT",
+                    "S": "BUY",
+                    "X": "NEW",
+                    "i": order_id,
+                    "q": "0.001",
+                    "p": "70000.0",
+                    "z": "0",
+                    "l": "0",
+                    "L": "0",
+                    "T": 1710008000000 + order_id,
+                },
+            },
+            "v3",
+        )
+    assert len(bot._ws_order_event_times) <= bot._ws_fill_events_max
+    assert len(bot._aster_order_detail_cache) <= bot._ws_fill_events_max
+
+
+@pytest.mark.asyncio
+async def test_listen_key_expired_does_not_advance_last_message_ms(caplog):
+    import logging as _logging
+
+    bot = _make_bot()
+    bot._ws_last_message_ms = 0
+    with caplog.at_level(_logging.WARNING):
+        await bot._handle_private_ws_message(
+            {"e": "listenKeyExpired", "E": 1710006000000},
+            "v3",
+        )
+    assert bot._ws_last_message_ms == 0
+    assert any("listen key expired" in rec.message.lower() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_account_update_partial_does_not_wipe_other_positions():
+    bot = _make_bot()
+    bot.balance = 0.0
+    bot.handle_balance_update = AsyncMock()
+    bot._ws_positions_cache = [
+        {"symbol": "ETH/USDT:USDT", "position_side": "long", "size": 1.0, "price": 3000.0},
+        {"symbol": "BTC/USDT:USDT", "position_side": "long", "size": 0.02, "price": 70000.0},
+    ]
+    bot._ws_positions_cache_ts = 1.0
+    await bot._handle_private_ws_message(
+        {
+            "e": "ACCOUNT_UPDATE",
+            "E": 1710004000100,
+            "a": {
+                "B": [{"a": "USDT", "wb": "42.5"}],
+                "P": [{"s": "BTCUSDT", "pa": "0.03", "ep": "70100", "ps": "LONG"}],
+            },
+        },
+        "v3",
+    )
+    symbols = {(p["symbol"], p["position_side"]): p for p in bot._ws_positions_cache}
+    assert ("ETH/USDT:USDT", "long") in symbols
+    assert symbols[("ETH/USDT:USDT", "long")]["size"] == 1.0
+    assert symbols[("BTC/USDT:USDT", "long")]["size"] == 0.03
+
+
+@pytest.mark.asyncio
+async def test_account_update_close_removes_only_closed_symbol():
+    bot = _make_bot()
+    bot.balance = 0.0
+    bot.handle_balance_update = AsyncMock()
+    bot._ws_positions_cache = [
+        {"symbol": "ETH/USDT:USDT", "position_side": "long", "size": 1.0, "price": 3000.0},
+        {"symbol": "BTC/USDT:USDT", "position_side": "long", "size": 0.02, "price": 70000.0},
+    ]
+    bot._ws_positions_cache_ts = 1.0
+    await bot._handle_private_ws_message(
+        {
+            "e": "ACCOUNT_UPDATE",
+            "E": 1710004000200,
+            "a": {
+                "B": [{"a": "USDT", "wb": "42.5"}],
+                "P": [{"s": "BTCUSDT", "pa": "0", "ep": "0", "ps": "LONG"}],
+            },
+        },
+        "v3",
+    )
+    symbols = {(p["symbol"], p["position_side"]) for p in bot._ws_positions_cache}
+    assert ("ETH/USDT:USDT", "long") in symbols
+    assert ("BTC/USDT:USDT", "long") not in symbols
 
 
 @pytest.mark.asyncio

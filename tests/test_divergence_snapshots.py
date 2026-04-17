@@ -102,6 +102,53 @@ async def test_handle_balance_update_captures_suspicious_ws_change():
 
 
 @pytest.mark.asyncio
+async def test_suspicious_balance_update_preserves_old_balance(tmp_path: Path):
+    bot = _mk_bot()
+    bot._debug_snapshot_dir = str(tmp_path) + "/"
+    bot.balance = 0.2
+    bot._previous_balance = 0.2  # simulate post-reassignment state
+    path = await bot.maybe_capture_divergence_snapshot(
+        "suspicious_balance_update",
+        extra={"source": "WS:v3", "old_balance": 117.0, "new_balance": 0.2},
+        throttle_ms=0,
+    )
+    assert path is not None
+    payload = json.loads(Path(path).read_text())
+    assert payload["state"]["balance"] == pytest.approx(0.2)
+    assert payload["state"]["previous_balance"] == pytest.approx(117.0)
+    assert payload["state"]["previous_balance"] != payload["state"]["balance"]
+
+
+@pytest.mark.asyncio
+async def test_fill_event_trigger_throttles_rapid_bursts(tmp_path: Path):
+    bot = _mk_bot()
+    bot._debug_snapshot_dir = str(tmp_path) + "/"
+    paths = []
+    for _ in range(10):
+        p = await bot.maybe_capture_divergence_snapshot(
+            "fill_event", extra={"fe": "x"}, throttle_ms=500
+        )
+        paths.append(p)
+    written = [p for p in paths if p is not None]
+    assert len(written) == 1
+
+
+@pytest.mark.asyncio
+async def test_throttle_is_serialized_under_lock(tmp_path: Path):
+    bot = _mk_bot()
+    bot._debug_snapshot_dir = str(tmp_path) + "/"
+
+    async def shot():
+        return await bot.maybe_capture_divergence_snapshot(
+            "concurrent_trigger", extra={"k": "v"}, throttle_ms=500
+        )
+
+    results = await asyncio.gather(shot(), shot(), shot())
+    written = [p for p in results if p is not None]
+    assert len(written) == 1
+
+
+@pytest.mark.asyncio
 async def test_execute_orders_parent_captures_order_post_burst():
     bot = _mk_bot()
     bot.add_to_recent_order_executions = lambda order: bot.recent_order_executions.append(order)

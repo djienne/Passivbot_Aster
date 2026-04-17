@@ -3798,13 +3798,6 @@ def deduce_side_pside(elm: dict) -> Tuple[str, str]:
 
 EXCHANGE_BOT_CLASSES: Dict[str, Tuple[str, str]] = {
     "aster": ("exchanges.aster", "AsterBot"),
-    "binance": ("exchanges.binance", "BinanceBot"),
-    "bitget": ("exchanges.bitget", "BitgetBot"),
-    "bybit": ("exchanges.bybit", "BybitBot"),
-    "hyperliquid": ("exchanges.hyperliquid", "HyperliquidBot"),
-    "gateio": ("exchanges.gateio", "GateIOBot"),
-    "kucoin": ("exchanges.kucoin", "KucoinBot"),
-    "okx": ("exchanges.okx", "OKXBot"),
 }
 
 

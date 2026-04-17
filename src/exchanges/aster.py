@@ -17,7 +17,7 @@ from exchanges.aster_rest import (
     aster_symbol_to_passivbot_symbol,
 )
 from exchanges.aster_ws import AsterWebsocketConfig, AsterWebsocketManager
-from passivbot import Passivbot, custom_id_to_snake, logging, round_
+from passivbot import Passivbot, custom_id_to_snake, logging, round_, round_dn, round_up
 from utils import utc_ms
 
 
@@ -144,6 +144,20 @@ class AsterBot(Passivbot):
         trim_count = max(0, len(ordered_ids) - self._ws_fill_events_max)
         for event_id in ordered_ids[:trim_count]:
             self._ws_fill_events_cache.pop(event_id, None)
+
+    def _prune_order_state_caches(self) -> None:
+        cap = self._ws_fill_events_max
+        if len(self._ws_order_event_times) > cap:
+            ordered = sorted(
+                self._ws_order_event_times.items(), key=lambda kv: kv[1]
+            )
+            trim = len(ordered) - cap
+            for order_id, _ in ordered[:trim]:
+                self._ws_order_event_times.pop(order_id, None)
+        if len(self._aster_order_detail_cache) > cap:
+            trim = len(self._aster_order_detail_cache) - cap
+            for key in list(self._aster_order_detail_cache.keys())[:trim]:
+                self._aster_order_detail_cache.pop(key, None)
 
     def _effective_hedge_mode(self) -> bool:
         return bool(self._config_hedge_mode and self.hedge_mode)
@@ -311,6 +325,8 @@ class AsterBot(Passivbot):
         order_type = str(order.get("type", "limit")).lower()
         if order_type == "market" and not self.live_value("market_orders_allowed"):
             return "market orders are disabled by config"
+        if qty <= 0.0:
+            return f"qty {qty} rounded to zero for step {self.qty_steps.get(symbol, 0.0)}"
         min_qty = float(self.min_qtys.get(symbol, 0.0) or 0.0)
         if min_qty and qty < min_qty:
             return f"qty {qty} below min_qty {min_qty}"
@@ -437,6 +453,20 @@ class AsterBot(Passivbot):
 
     def _set_ws_positions_cache(self, positions: list[dict]) -> None:
         self._ws_positions_cache = [dict(x) for x in positions]
+        self._ws_positions_cache_ts = time.monotonic()
+
+    def _merge_ws_positions(
+        self,
+        upserts: list[dict],
+        removals: list[tuple[str, str]],
+    ) -> None:
+        existing = list(self._ws_positions_cache or [])
+        keyed = {(str(p.get("symbol")), str(p.get("position_side"))): dict(p) for p in existing}
+        for pos in upserts:
+            keyed[(str(pos.get("symbol")), str(pos.get("position_side")))] = dict(pos)
+        for key in removals:
+            keyed.pop((str(key[0]), str(key[1])), None)
+        self._ws_positions_cache = list(keyed.values())
         self._ws_positions_cache_ts = time.monotonic()
 
     def _set_ws_open_orders_cache(self, orders: list[dict]) -> None:
@@ -657,6 +687,12 @@ class AsterBot(Passivbot):
     async def _handle_private_ws_message(self, payload: dict[str, Any], mode: str) -> None:
         event_type = str(payload.get("e") or payload.get("eventType") or "")
         event_time = _safe_int(payload.get("E") or payload.get("eventTime") or payload.get("T"))
+        if event_type == "listenKeyExpired":
+            logging.warning(
+                "Aster private WS listen key expired; reconnect requested. payload=%s",
+                payload,
+            )
+            return
         if event_type:
             last_seen = self._ws_private_event_times.get(event_type, 0)
             if event_time and event_time < last_seen:
@@ -676,25 +712,29 @@ class AsterBot(Passivbot):
                 self.balance = balance_total
                 if previous_balance != balance_total:
                     await self.handle_balance_update(source=f"WS:{mode}")
-            normalized_positions = []
+            upserts: list[dict] = []
+            removals: list[tuple[str, str]] = []
             for pos in positions:
-                size = abs(_safe_float(pos.get("pa") or pos.get("positionAmt")))
-                if size == 0.0:
-                    continue
+                raw_amt = _safe_float(pos.get("pa") or pos.get("positionAmt"))
+                size = abs(raw_amt)
                 raw_symbol = str(pos.get("s") or pos.get("symbol") or "").upper()
                 position_side = str(pos.get("ps") or pos.get("positionSide") or "").lower()
                 if position_side not in {"long", "short"}:
-                    position_side = "long" if _safe_float(pos.get("pa") or pos.get("positionAmt")) > 0 else "short"
-                normalized_positions.append(
+                    position_side = "long" if raw_amt > 0 else "short"
+                mapped_symbol = self._raw_symbol_to_symbol(raw_symbol, pos)
+                if size == 0.0:
+                    removals.append((mapped_symbol, position_side))
+                    continue
+                upserts.append(
                     {
-                        "symbol": self._raw_symbol_to_symbol(raw_symbol, pos),
+                        "symbol": mapped_symbol,
                         "position_side": position_side,
                         "size": size,
                         "price": _safe_float(pos.get("ep") or pos.get("entryPrice")),
                     }
                 )
             if positions:
-                self._set_ws_positions_cache(normalized_positions)
+                self._merge_ws_positions(upserts, removals)
                 self.execution_scheduled = True
         elif event_type == "ORDER_TRADE_UPDATE":
             order_data = payload.get("o", {}) if isinstance(payload.get("o"), dict) else {}
@@ -727,13 +767,19 @@ class AsterBot(Passivbot):
                 self._replace_ws_open_order(normalized_order)
             elif order_id:
                 self._remove_ws_open_order(order_id)
+            if status in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"} and order_id:
+                self._ws_order_event_times.pop(order_id, None)
+                self._aster_order_detail_cache.pop(
+                    self._order_cache_key(symbol, order_id), None
+                )
+            self._prune_order_state_caches()
             fill_event = self._build_fill_event_from_ws_order(order_data, event_time)
             if fill_event is not None:
                 self.execution_scheduled = True
                 await self.maybe_capture_divergence_snapshot(
                     "fill_event",
                     extra={"fill_event": fill_event, "mode": mode},
-                    force=True,
+                    throttle_ms=500,
                 )
             self.handle_order_update([normalized_order])
         elif event_type == "ACCOUNT_CONFIG_UPDATE":
@@ -746,11 +792,6 @@ class AsterBot(Passivbot):
                 )
             if "pm" in payload:
                 self._aster_dual_side_position = _safe_bool(payload.get("pm"), default=False)
-        elif event_type == "listenKeyExpired":
-            logging.warning(
-                "Aster private WS listen key expired; reconnect requested. payload=%s",
-                payload,
-            )
 
     async def _handle_public_ws_message(self, payload: dict[str, Any], stream: Optional[str]) -> None:
         if not isinstance(payload, dict):
@@ -895,14 +936,20 @@ class AsterBot(Passivbot):
         qty = abs(float(normalized_order["qty"]))
         qty_step = float(self.qty_steps.get(normalized_order["symbol"], 0.0) or 0.0)
         if qty_step > 0.0:
-            qty = float(round_(qty, qty_step))
+            qty = float(round_dn(qty, qty_step))
         normalized_order["qty"] = qty
 
         if normalized_order.get("price") is not None:
             price = float(normalized_order["price"])
             price_step = float(self.price_steps.get(normalized_order["symbol"], 0.0) or 0.0)
             if price_step > 0.0:
-                price = float(round_(price, price_step))
+                side = str(normalized_order.get("side", "")).lower()
+                if side == "buy":
+                    price = float(round_dn(price, price_step))
+                elif side == "sell":
+                    price = float(round_up(price, price_step))
+                else:
+                    price = float(round_(price, price_step))
             normalized_order["price"] = price
 
         validation_error = self._validate_order(normalized_order)
@@ -1002,9 +1049,10 @@ class AsterBot(Passivbot):
         self._aster_multi_assets_mode = current_multi_assets
 
     async def update_exchange_config_by_symbols(self, symbols: list):
-        for symbol in symbols:
-            if symbol not in self.markets_dict:
-                continue
+        relevant_symbols = [s for s in symbols if s in self.markets_dict]
+        for idx, symbol in enumerate(relevant_symbols):
+            if idx > 0:
+                await asyncio.sleep(0.2)
             leverage = int(self.config_get(["live", "leverage"], symbol=symbol))
             max_leverage = int(self.max_leverage.get(symbol, 0) or 0)
             if max_leverage > 0:
@@ -1018,8 +1066,7 @@ class AsterBot(Passivbot):
                 await self.cca.set_margin_type(symbol, "CROSSED")
                 logging.info("%s: set cross margin mode", symbol)
             except AsterAPIError as exc:
-                msg = str(exc).lower()
-                if "no need to change" in msg or "same margin type" in msg:
+                if exc.code == -4046 or "no need to change" in str(exc).lower():
                     logging.info("%s: cross margin mode already set", symbol)
                 else:
                     logging.error("%s: error setting cross margin mode %s", symbol, exc)

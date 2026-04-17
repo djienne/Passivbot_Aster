@@ -205,9 +205,7 @@ class AsterWebsocketManager:
                             raise TimeoutError("aster private websocket stale")
                         continue
                     if msg.type == aiohttp.WSMsgType.TEXT:
-                        self._last_private_message_s = time.monotonic()
                         payload = json.loads(msg.data)
-                        await self._call_callback(private_message_callback, payload, mode)
                         if payload.get("e") == "listenKeyExpired":
                             age_s = max(0.0, time.monotonic() - self._private_connected_at_s)
                             logging.warning(
@@ -218,6 +216,8 @@ class AsterWebsocketManager:
                             raise AsterListenKeyExpired(
                                 f"listen key expired after {age_s:.2f}s"
                             )
+                        self._last_private_message_s = time.monotonic()
+                        await self._call_callback(private_message_callback, payload, mode)
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         raise ConnectionError("aster private websocket closed")
             except asyncio.CancelledError:

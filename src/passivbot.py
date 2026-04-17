@@ -5236,9 +5236,19 @@ class Passivbot(ExchangeInterface):
             "live": deepcopy(self.config.get("live", {})),
             "bot": deepcopy(self.config.get("bot", {})),
         }
+        previous_balance_override = None
+        if isinstance(extra, dict):
+            if "old_balance" in extra:
+                previous_balance_override = extra["old_balance"]
+            elif "previous_balance_snapshot" in extra:
+                previous_balance_override = extra["previous_balance_snapshot"]
         state = {
             "balance": float(getattr(self, "balance", 0.0)),
-            "previous_balance": float(getattr(self, "_previous_balance", 0.0)),
+            "previous_balance": float(
+                previous_balance_override
+                if previous_balance_override is not None
+                else getattr(self, "_previous_balance", 0.0)
+            ),
             "active_symbols": list(getattr(self, "active_symbols", []) or []),
             "positions": deepcopy(getattr(self, "positions", {})),
             "fetched_positions": deepcopy(getattr(self, "fetched_positions", [])),
@@ -5329,13 +5339,13 @@ class Passivbot(ExchangeInterface):
         if not self._divergence_snapshots_enabled():
             return None
         now = utc_ms()
-        if not force:
-            last = self._debug_snapshot_last_ms.get(trigger, 0)
-            if throttle_ms > 0 and now - last < throttle_ms:
-                return None
-        self._debug_snapshot_last_ms[trigger] = now
         try:
             async with self._debug_snapshot_lock:
+                if not force:
+                    last = self._debug_snapshot_last_ms.get(trigger, 0)
+                    if throttle_ms > 0 and now - last < throttle_ms:
+                        return None
+                self._debug_snapshot_last_ms[trigger] = now
                 self._debug_snapshot_seq += 1
                 payload = self._build_divergence_snapshot_payload(trigger, extra=extra)
                 slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(trigger)).strip("_")[:64] or "snapshot"
@@ -5870,59 +5880,14 @@ class Passivbot(ExchangeInterface):
 def setup_bot(config):
     """Instantiate the correct exchange bot implementation based on configuration."""
     user_info = load_user_info(require_live_value(config, "user"))
-    if user_info["exchange"] == "bybit":
-        from exchanges.bybit import BybitBot
-
-        bot = BybitBot(config)
-    elif user_info["exchange"] == "bitget":
-        from exchanges.bitget import BitgetBot
-
-        bot = BitgetBot(config)
-    elif user_info["exchange"] == "binance":
-        from exchanges.binance import BinanceBot
-
-        bot = BinanceBot(config)
-    elif user_info["exchange"] == "okx":
-        from exchanges.okx import OKXBot
-
-        bot = OKXBot(config)
-    elif user_info["exchange"] == "hyperliquid":
-        from exchanges.hyperliquid import HyperliquidBot
-
-        bot = HyperliquidBot(config)
-    elif user_info["exchange"] == "gateio":
-        from exchanges.gateio import GateIOBot
-
-        bot = GateIOBot(config)
-    elif user_info["exchange"] == "defx":
-        from exchanges.defx import DefxBot
-
-        bot = DefxBot(config)
-    elif user_info["exchange"] == "kucoin":
-        from exchanges.kucoin import KucoinBot
-
-        bot = KucoinBot(config)
-    elif user_info["exchange"] == "paradex":
-        from exchanges.paradex import ParadexBot
-
-        bot = ParadexBot(config)
-    elif user_info["exchange"] == "lighter":
-        from exchanges.lighter import LighterBot
-
-        bot = LighterBot(config)
-    elif user_info["exchange"] == "aster":
+    exchange = user_info.get("exchange")
+    if exchange == "aster":
         from exchanges.aster import AsterBot
 
-        bot = AsterBot(config)
-    else:
-        # Generic CCXTBot for any CCXT-supported exchange
-        from exchanges.ccxt_bot import CCXTBot
-
-        bot = CCXTBot(config)
-        logging.info(
-            f"Using generic CCXTBot for '{user_info['exchange']}' (no custom implementation)"
-        )
-    return bot
+        return AsterBot(config)
+    raise RuntimeError(
+        f"unsupported exchange '{exchange}': this fork only supports exchange=aster"
+    )
 
 
 async def shutdown_bot(bot):
