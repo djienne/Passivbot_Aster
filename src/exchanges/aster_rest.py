@@ -434,8 +434,8 @@ class AsterRestClient:
 
     def _next_timestamp_ms(self) -> int:
         candidate = int(round(time.time() * 1000))
-        if candidate < self._last_timestamp_ms:
-            candidate = self._last_timestamp_ms
+        if candidate <= self._last_timestamp_ms:
+            candidate = self._last_timestamp_ms + 1
         self._last_timestamp_ms = candidate
         return candidate
 
@@ -827,11 +827,13 @@ class AsterRestClient:
         extracted = _extract_payload(payload)
         return extracted if isinstance(extracted, dict) else {}
 
-    async def cancel_all_open_orders(self, symbol: str) -> dict[str, Any]:
+    async def cancel_all_open_orders(self, symbol: str) -> Any:
         params = {"symbol": passivbot_symbol_to_aster_symbol(symbol)}
         payload = await self._private_request_json("DELETE", ASTER_ALL_OPEN_ORDERS_PATHS, params=params)
         extracted = _extract_payload(payload)
-        return extracted if isinstance(extracted, dict) else {}
+        if isinstance(extracted, (dict, list)):
+            return extracted
+        return {}
 
     async def cancel_batch_orders(
         self,

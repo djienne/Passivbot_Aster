@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -161,6 +162,15 @@ class AsterBot(Passivbot):
 
     def _effective_hedge_mode(self) -> bool:
         return bool(self._config_hedge_mode and self.hedge_mode)
+
+    def _is_dust_position(self, symbol: str, position_amt: float) -> bool:
+        if position_amt == 0.0:
+            return True
+        qty_step = 0.0
+        qty_steps = getattr(self, "qty_steps", None)
+        if isinstance(qty_steps, dict):
+            qty_step = float(qty_steps.get(symbol, 0.0) or 0.0)
+        return qty_step > 0.0 and abs(position_amt) < qty_step / 2.0
 
     def _raw_symbol_to_symbol(self, raw_symbol: str, raw: Optional[dict[str, Any]] = None) -> str:
         raw_symbol = str(raw_symbol or "").upper()
@@ -363,7 +373,8 @@ class AsterBot(Passivbot):
         for elm in fetched:
             raw_symbol = str(elm.get("symbol") or "").upper()
             position_amt = _safe_float(elm.get("positionAmt"))
-            if position_amt == 0.0:
+            symbol = self._raw_symbol_to_symbol(raw_symbol, elm)
+            if self._is_dust_position(symbol, position_amt):
                 continue
             raw_ps = str(elm.get("positionSide") or "BOTH").upper()
             if raw_ps == "LONG":
@@ -374,7 +385,7 @@ class AsterBot(Passivbot):
                 position_side = "long" if position_amt > 0.0 else "short"
             positions.append(
                 {
-                    "symbol": self._raw_symbol_to_symbol(raw_symbol, elm),
+                    "symbol": symbol,
                     "position_side": position_side,
                     "size": abs(position_amt),
                     "price": _safe_float(elm.get("entryPrice")),
@@ -582,13 +593,14 @@ class AsterBot(Passivbot):
         for elm in positions:
             raw_symbol = str(elm.get("symbol") or "").upper()
             position_amt = _safe_float(elm.get("positionAmt"))
-            if position_amt == 0.0:
+            symbol = self._raw_symbol_to_symbol(raw_symbol, elm)
+            if self._is_dust_position(symbol, position_amt):
                 continue
             raw_ps = str(elm.get("positionSide") or "BOTH").upper()
             position_side = "long" if raw_ps == "LONG" or (raw_ps == "BOTH" and position_amt > 0.0) else "short"
             fresh_positions.append(
                 {
-                    "symbol": self._raw_symbol_to_symbol(raw_symbol, elm),
+                    "symbol": symbol,
                     "position_side": position_side,
                     "size": abs(position_amt),
                     "price": _safe_float(elm.get("entryPrice")),
@@ -689,8 +701,8 @@ class AsterBot(Passivbot):
         event_time = _safe_int(payload.get("E") or payload.get("eventTime") or payload.get("T"))
         if event_type == "listenKeyExpired":
             logging.warning(
-                "Aster private WS listen key expired; reconnect requested. payload=%s",
-                payload,
+                "Aster private WS listen key expired; reconnect requested. event_time=%s",
+                event_time or "unknown",
             )
             return
         if event_type:
@@ -791,7 +803,16 @@ class AsterBot(Passivbot):
                     int(self.max_leverage.get(symbol, 0) or 0),
                 )
             if "pm" in payload:
-                self._aster_dual_side_position = _safe_bool(payload.get("pm"), default=False)
+                new_mode = _safe_bool(payload.get("pm"), default=False)
+                if new_mode != self._aster_dual_side_position:
+                    logging.warning(
+                        "Aster position mode changed mid-run: dualSidePosition %s -> %s; invalidating position cache.",
+                        self._aster_dual_side_position,
+                        new_mode,
+                    )
+                    self._ws_positions_cache = []
+                    self._ws_positions_cache_ts = 0.0
+                self._aster_dual_side_position = new_mode
 
     async def _handle_public_ws_message(self, payload: dict[str, Any], stream: Optional[str]) -> None:
         if not isinstance(payload, dict):
@@ -810,7 +831,7 @@ class AsterBot(Passivbot):
         self._ws_last_message_ms = utc_ms()
         bid = _safe_float(payload.get("b") or payload.get("bidPrice") or payload.get("bid"))
         ask = _safe_float(payload.get("a") or payload.get("askPrice") or payload.get("ask"))
-        if bid < 0.0 or ask < 0.0:
+        if not math.isfinite(bid) or not math.isfinite(ask) or bid < 0.0 or ask < 0.0:
             return
         self._ws_tickers_cache[symbol] = {
             "bid": bid,

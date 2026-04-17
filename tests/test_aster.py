@@ -228,7 +228,7 @@ def test_aster_configuration_defaults():
     assert cfg.balance_mode == "auto"
 
 
-def test_sign_v3_params_nonce_is_monotonic_when_clock_repeats():
+def test_sign_v3_params_nonce_and_timestamp_are_strictly_monotonic_when_clock_repeats():
     client = AsterRestClient(
         AsterConfiguration(
             api_user=ASTER_USER_INFO["api_user"],
@@ -242,7 +242,7 @@ def test_sign_v3_params_nonce_is_monotonic_when_clock_repeats():
         first = client._sign_v3_params({})
         second = client._sign_v3_params({})
     assert int(second["nonce"]) == int(first["nonce"]) + 1
-    assert int(second["timestamp"]) == int(first["timestamp"])
+    assert int(second["timestamp"]) == int(first["timestamp"]) + 1
 
 
 @pytest.mark.asyncio
@@ -898,13 +898,16 @@ async def test_listen_key_expired_does_not_advance_last_message_ms(caplog):
 
     bot = _make_bot()
     bot._ws_last_message_ms = 0
+    secret_field = "DO_NOT_LOG_THIS_SECRET"
     with caplog.at_level(_logging.WARNING):
         await bot._handle_private_ws_message(
-            {"e": "listenKeyExpired", "E": 1710006000000},
+            {"e": "listenKeyExpired", "E": 1710006000000, "privateToken": secret_field},
             "v3",
         )
     assert bot._ws_last_message_ms == 0
     assert any("listen key expired" in rec.message.lower() for rec in caplog.records)
+    assert secret_field not in caplog.text
+    assert "privateToken" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1092,3 +1095,156 @@ def test_build_fetcher_for_bot_supports_aster():
     bot = _make_bot()
     fetcher = _build_fetcher_for_bot(bot, ["BTC/USDT:USDT"])
     assert fetcher.__class__.__name__ == "AsterFetcher"
+
+
+def test_next_timestamp_ms_is_strictly_monotonic_when_wall_clock_repeats():
+    client = AsterRestClient(
+        AsterConfiguration(
+            api_user=ASTER_USER_INFO["api_user"],
+            api_signer=ASTER_USER_INFO["api_signer"],
+            api_private_key=ASTER_USER_INFO["api_private_key"],
+        )
+    )
+    with patch("exchanges.aster_rest.time.time", return_value=1000.0):
+        first = client._next_timestamp_ms()
+        second = client._next_timestamp_ms()
+        third = client._next_timestamp_ms()
+    assert second == first + 1
+    assert third == second + 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_positions_filters_dust_with_position_side_both():
+    bot = _make_bot()
+    bot._ws_positions_cache = None
+    bot._ws_positions_cache_ts = 0.0
+    bot.cca = SimpleNamespace(
+        fetch_position_risk=AsyncMock(
+            return_value=[
+                {"symbol": "BTCUSDT", "positionAmt": "0.0000000000001", "positionSide": "BOTH", "entryPrice": "0"},
+                {"symbol": "ETHUSDT", "positionAmt": "0.5", "positionSide": "LONG", "entryPrice": "3000"},
+            ]
+        )
+    )
+    positions = await bot.fetch_positions()
+    symbols = {(p["symbol"], p["position_side"]): p for p in positions}
+    assert ("BTC/USDT:USDT", "long") not in symbols
+    assert ("BTC/USDT:USDT", "short") not in symbols
+    assert symbols[("ETH/USDT:USDT", "long")]["size"] == 0.5
+
+
+def test_handle_public_ws_message_rejects_nan_bid():
+    bot = _make_bot()
+    bot._ws_tickers_cache = {}
+    bot._ws_ticker_event_times = {}
+    bot._ws_last_message_ms = 0
+    payload = {
+        "s": "BTCUSDT",
+        "E": 1710007000000,
+        "b": "nan",
+        "a": "70000.5",
+    }
+    asyncio.run(bot._handle_public_ws_message(payload, "bookTicker"))
+    assert "BTC/USDT:USDT" not in bot._ws_tickers_cache
+
+
+def test_handle_public_ws_message_rejects_infinite_ask():
+    bot = _make_bot()
+    bot._ws_tickers_cache = {}
+    bot._ws_ticker_event_times = {}
+    bot._ws_last_message_ms = 0
+    payload = {
+        "s": "BTCUSDT",
+        "E": 1710007000000,
+        "b": "70000.0",
+        "a": "inf",
+    }
+    asyncio.run(bot._handle_public_ws_message(payload, "bookTicker"))
+    assert "BTC/USDT:USDT" not in bot._ws_tickers_cache
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_open_orders_returns_list_response_unchanged():
+    client = AsterRestClient(
+        AsterConfiguration(
+            api_user=ASTER_USER_INFO["api_user"],
+            api_signer=ASTER_USER_INFO["api_signer"],
+            api_private_key=ASTER_USER_INFO["api_private_key"],
+        )
+    )
+    fake_list = [{"orderId": 1, "status": "CANCELED"}, {"orderId": 2, "status": "CANCELED"}]
+    with patch.object(client, "_private_request_json", AsyncMock(return_value=fake_list)):
+        result = await client.cancel_all_open_orders("BTC/USDT:USDT")
+    assert result == fake_list
+
+
+@pytest.mark.asyncio
+async def test_account_config_update_invalidates_positions_cache_on_mode_flip(caplog):
+    import logging as _logging
+
+    bot = _make_bot()
+    bot._aster_dual_side_position = False
+    bot._ws_positions_cache = [
+        {"symbol": "BTC/USDT:USDT", "position_side": "long", "size": 0.02, "price": 70000.0},
+    ]
+    bot._ws_positions_cache_ts = 5.0
+    with caplog.at_level(_logging.WARNING):
+        await bot._handle_private_ws_message(
+            {
+                "e": "ACCOUNT_CONFIG_UPDATE",
+                "E": 1710008100000,
+                "pm": True,
+            },
+            "v3",
+        )
+    assert bot._aster_dual_side_position is True
+    assert bot._ws_positions_cache == []
+    assert bot._ws_positions_cache_ts == 0.0
+    assert any("position mode changed" in rec.message.lower() for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_account_config_update_noop_when_mode_unchanged():
+    bot = _make_bot()
+    bot._aster_dual_side_position = True
+    cached = [
+        {"symbol": "BTC/USDT:USDT", "position_side": "long", "size": 0.02, "price": 70000.0},
+    ]
+    bot._ws_positions_cache = list(cached)
+    bot._ws_positions_cache_ts = 5.0
+    await bot._handle_private_ws_message(
+        {"e": "ACCOUNT_CONFIG_UPDATE", "E": 1710008200000, "pm": True},
+        "v3",
+    )
+    assert bot._aster_dual_side_position is True
+    assert bot._ws_positions_cache == cached
+    assert bot._ws_positions_cache_ts == 5.0
+
+
+@pytest.mark.asyncio
+async def test_keepalive_loop_survives_transient_failure(monkeypatch):
+    from exchanges.aster_ws import AsterWebsocketManager
+
+    config = AsterWebsocketConfig(keepalive_interval_seconds=1.0, forced_reconnect_seconds=86400.0)
+    rest_client = SimpleNamespace(
+        keepalive_listen_key=AsyncMock(side_effect=[RuntimeError("boom"), None, asyncio.CancelledError()])
+    )
+    mgr = AsterWebsocketManager(config, rest_client)
+    mgr._listen_key = "fake-listen-key"
+
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(float(seconds))
+        if len(sleep_calls) >= 4:
+            mgr._stop.set()
+
+    monkeypatch.setattr("exchanges.aster_ws.asyncio.sleep", fake_sleep)
+
+    try:
+        await mgr._keepalive_loop()
+    except asyncio.CancelledError:
+        pass
+
+    assert rest_client.keepalive_listen_key.await_count >= 2
+    assert any(abs(s - min(config.keepalive_interval_seconds, 300.0)) < 1e-6 for s in sleep_calls)

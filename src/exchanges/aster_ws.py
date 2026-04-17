@@ -111,11 +111,24 @@ class AsterWebsocketManager:
         return listen_key, "v3"
 
     async def _keepalive_loop(self) -> None:
+        retry_backoff_seconds = 300.0
+        next_sleep_seconds = self.config.keepalive_interval_seconds
         while not self._stop.is_set() and self._listen_key:
-            await asyncio.sleep(self.config.keepalive_interval_seconds)
+            await asyncio.sleep(next_sleep_seconds)
+            next_sleep_seconds = self.config.keepalive_interval_seconds
             if self._stop.is_set() or not self._listen_key:
                 return
-            await self.rest_client.keepalive_listen_key(self._listen_key)
+            try:
+                await self.rest_client.keepalive_listen_key(self._listen_key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                next_sleep_seconds = min(self.config.keepalive_interval_seconds, retry_backoff_seconds)
+                logging.warning(
+                    "Aster listen key keepalive failed (%s); retrying in %.0fs.",
+                    exc,
+                    next_sleep_seconds,
+                )
 
     def _private_stream_is_stale(self) -> bool:
         stale_seconds = self.config.private_stale_seconds
